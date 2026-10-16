@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,6 +24,11 @@ type Index struct {
 	Files      IndexFiles
 	indexFile  string
 	packRoot   string
+	// Lock is the sync lock that was in force the last time this index was refreshed,
+	// or nil when the pack does not lock any folders.
+	Lock *SyncLock
+	// LockViolations records everything the sync lock rejected during the last refresh.
+	LockViolations []SyncViolation
 }
 
 // indexTomlRepresentation is the TOML representation of Index (Files must be converted)
@@ -169,6 +175,20 @@ func (in *Index) Refresh() error {
 	// TODO: If needed, multithreaded hashing
 	// for i := 0; i < runtime.NumCPU(); i++ {}
 
+	// Load the sync lock (if the pack declares one). Files that end up outside of the locked
+	// folders are kept out of the index, and the index is the only thing packwiz-installer
+	// downloads from - so this is what makes the installer refuse out-of-scope files.
+	lock, err := LoadSyncLock()
+	if err != nil {
+		return err
+	}
+	in.LockViolations = nil
+	if lock.IsActive() {
+		in.Lock = &lock
+	} else {
+		in.Lock = nil
+	}
+
 	// Is case-sensitivity a problem?
 	pathPF, _ := filepath.Abs(viper.GetString("pack-file"))
 	pathIndex, _ := filepath.Abs(in.indexFile)
@@ -177,7 +197,7 @@ func (in *Index) Refresh() error {
 	ignore, ignoreExists := readGitignore(pathIgnore)
 
 	var fileList []string
-	err := filepath.WalkDir(in.packRoot, func(path string, info os.DirEntry, err error) error {
+	err = filepath.WalkDir(in.packRoot, func(path string, info os.DirEntry, err error) error {
 		if err != nil {
 			// TODO: Handle errors on individual files properly
 			return err
@@ -192,6 +212,17 @@ func (in *Index) Refresh() error {
 			// Don't traverse ignored directories (consistent with Git handling of ignored dirs)
 			if ignore.MatchesPath(path) {
 				return fs.SkipDir
+			}
+			// Prune whole folders that cannot contain any allowed file
+			if in.Lock != nil {
+				if relPath, relErr := in.RelIndexPath(path); relErr == nil && !in.Lock.CouldContain(relPath) {
+					if in.lockReject(SyncViolation{
+						Path:   relPath + "/",
+						Reason: "folder is outside of the locked folders",
+					}) {
+						return fs.SkipDir
+					}
+				}
 			}
 			// Don't add directories to the file list
 			return nil
@@ -208,6 +239,31 @@ func (in *Index) Refresh() error {
 		}
 		if ignore.MatchesPath(path) {
 			return nil
+		}
+
+		// Enforce the sync lock before the file is allowed into the index
+		if in.Lock != nil {
+			relPath, relErr := in.RelIndexPath(path)
+			if relErr != nil {
+				relPath = path
+			}
+			if lockErr := in.Lock.Check(relPath); lockErr != nil {
+				if in.lockReject(SyncViolation{Path: relPath, Reason: lockErr.Error()}) {
+					return nil
+				}
+			}
+			if strings.HasSuffix(filepath.Base(path), MetaExtension) {
+				dest, destErr := in.lockCheckMetafile(relPath, path)
+				if destErr != nil {
+					violation := SyncViolation{Path: relPath, Reason: destErr.Error()}
+					if dest != "" && dest != relPath {
+						violation.Dest = dest
+					}
+					if in.lockReject(violation) {
+						return nil
+					}
+				}
+			}
 		}
 
 		fileList = append(fileList, path)
@@ -255,7 +311,138 @@ func (in *Index) Refresh() error {
 		}
 	}
 
+	// Final safety net: re-validate every entry that is going into the index, including the
+	// aliases, which packwiz-installer uses as the destination path of a file.
+	in.pruneLockViolations()
+	in.reportLockViolations()
+
 	return nil
+}
+
+// lockReject records a sync lock violation and reports whether the file has to be kept out of
+// the index. In "warn" mode the file is still indexed, but is always reported.
+func (in *Index) lockReject(v SyncViolation) bool {
+	in.LockViolations = append(in.LockViolations, v)
+	return in.Lock != nil && in.Lock.ModeValue() != SyncModeWarn
+}
+
+// lockCheckMetafile verifies that a metadata file, and the file it installs, are both inside
+// the locked folders. This is the check that stops a metadata file declaring a filename such
+// as "../../options.txt" from writing outside of the locked folders.
+func (in *Index) lockCheckMetafile(relPath string, absPath string) (string, error) {
+	var meta struct {
+		Filename string `toml:"filename"`
+	}
+	if _, err := toml.DecodeFile(absPath, &meta); err != nil {
+		return "", fmt.Errorf("could not read metadata file: %w", err)
+	}
+	return in.Lock.CheckMetaDest(relPath, meta.Filename)
+}
+
+// pruneLockViolations double checks every entry that is still in the index, including aliases.
+func (in *Index) pruneLockViolations() {
+	if in.Lock == nil || in.Lock.ModeValue() == SyncModeWarn {
+		return
+	}
+	for p, file := range in.Files {
+		var reason string
+		if err := in.Lock.Check(string(p)); err != nil {
+			reason = err.Error()
+		} else {
+			for _, alias := range file.getAliases() {
+				if err := in.Lock.Check(alias); err != nil {
+					reason = fmt.Sprintf("alias %q: %s", alias, err)
+					break
+				}
+			}
+		}
+		if reason != "" {
+			in.LockViolations = append(in.LockViolations, SyncViolation{Path: string(p), Reason: reason})
+			delete(in.Files, p)
+		}
+	}
+}
+
+// reportLockViolations prints a summary of everything the sync lock rejected.
+func (in *Index) reportLockViolations() {
+	if in.Lock == nil || len(in.LockViolations) == 0 {
+		return
+	}
+	lock := *in.Lock
+	if lock.ModeValue() == SyncModeWarn {
+		fmt.Printf("Warning: %d path(s) are outside of the locked folders but will still be synced (mode = %q)\n",
+			len(in.LockViolations), lock.ModeValue())
+	} else {
+		fmt.Printf("Sync lock: %s\n", lock.SyncLockDescription())
+		fmt.Printf("Excluded %d path(s) from the index:\n", len(in.LockViolations))
+	}
+	const maxPrinted = 25
+	for i, v := range in.LockViolations {
+		if i >= maxPrinted {
+			fmt.Printf("  ... and %d more (run 'packwiz lock show' for the configuration)\n", len(in.LockViolations)-maxPrinted)
+			break
+		}
+		label := v.Path
+		if v.Dest != "" {
+			label = fmt.Sprintf("%s -> %s", v.Path, v.Dest)
+		}
+		fmt.Printf("  - %s (%s)\n", label, v.Reason)
+	}
+}
+
+// HasStrictLockFailure reports whether the sync lock rejected something while running in
+// "deny" mode, in which case the calling command should exit with a non-zero status.
+func (in Index) HasStrictLockFailure() bool {
+	return in.Lock != nil && in.Lock.ModeValue() == SyncModeDeny && len(in.LockViolations) > 0
+}
+
+// CheckLock validates the whole index against a lock and returns every violation it finds.
+// Unlike Refresh it never modifies the index, which makes it usable as a read-only gate
+// (for example on a client that is about to hand the pack to packwiz-installer).
+func (in Index) CheckLock(lock SyncLock) []SyncViolation {
+	violations := []SyncViolation{}
+	if !lock.IsActive() {
+		return violations
+	}
+	paths := make([]string, 0, len(in.Files))
+	for p := range in.Files {
+		paths = append(paths, string(p))
+	}
+	sort.Strings(paths)
+
+	for _, p := range paths {
+		file := in.Files[p]
+		if err := lock.Check(p); err != nil {
+			violations = append(violations, SyncViolation{Path: p, Reason: err.Error()})
+			continue
+		}
+		for _, alias := range file.getAliases() {
+			if err := lock.Check(alias); err != nil {
+				violations = append(violations, SyncViolation{
+					Path:   p,
+					Reason: fmt.Sprintf("alias %q: %s", alias, err),
+				})
+			}
+		}
+		if !file.IsMetaFile() {
+			continue
+		}
+		var meta struct {
+			Filename string `toml:"filename"`
+		}
+		if _, err := toml.DecodeFile(in.ResolveIndexPath(p), &meta); err != nil {
+			violations = append(violations, SyncViolation{
+				Path:   p,
+				Reason: fmt.Sprintf("could not read metadata file: %s", err),
+			})
+			continue
+		}
+		dest, err := lock.CheckMetaDest(p, meta.Filename)
+		if err != nil {
+			violations = append(violations, SyncViolation{Path: p, Dest: dest, Reason: err.Error()})
+		}
+	}
+	return violations
 }
 
 // Write saves the index file

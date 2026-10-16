@@ -53,6 +53,10 @@ var refreshCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		fmt.Println("Index refreshed!")
+		if index.HasStrictLockFailure() {
+			fmt.Println("The sync lock is in \"deny\" mode and rejected the paths listed above; failing the build.")
+			os.Exit(1)
+		}
 	},
 }
 

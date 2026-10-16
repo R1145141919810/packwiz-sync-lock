@@ -30,6 +30,9 @@ type Pack struct {
 	Versions map[string]string                 `toml:"versions"`
 	Export   map[string]map[string]interface{} `toml:"export"`
 	Options  map[string]interface{}            `toml:"options"`
+	// Sync is the optional [sync] table, which locks the pack to a set of folders.
+	// It has to be part of the struct, otherwise rewriting pack.toml would drop it.
+	Sync *SyncLock `toml:"sync,omitempty"`
 }
 
 const CurrentPackFormat = "packwiz:1.1.0"

@@ -16,6 +16,9 @@ type IndexPathHolder interface {
 	markMetaFile()
 	markedFound() bool
 	IsMetaFile() bool
+	// getAliases returns every alias this entry installs to. Aliases are used as the
+	// destination path by packwiz-installer, so the sync lock has to check them too.
+	getAliases() []string
 }
 
 // indexFile is a file in the index
@@ -49,6 +52,13 @@ func (i *indexFile) markedFound() bool {
 
 func (i *indexFile) IsMetaFile() bool {
 	return i.MetaFile
+}
+
+func (i *indexFile) getAliases() []string {
+	if i.Alias == "" {
+		return nil
+	}
+	return []string{i.Alias}
 }
 
 type indexFileMultipleAlias map[string]indexFile
@@ -87,6 +97,16 @@ func (i *indexFileMultipleAlias) IsMetaFile() bool {
 		return v.MetaFile
 	}
 	panic("No entries in indexFileMultipleAlias")
+}
+
+func (i *indexFileMultipleAlias) getAliases() []string {
+	aliases := make([]string, 0, len(*i))
+	for k := range *i {
+		if k != "" {
+			aliases = append(aliases, k)
+		}
+	}
+	return aliases
 }
 
 // updateFileEntry updates the hash of a file and marks as found; adding it if it doesn't exist
