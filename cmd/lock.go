@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/BurntSushi/toml"
 	"github.com/packwiz/packwiz/core"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -65,6 +66,22 @@ var lockInitCmd = &cobra.Command{
 			os.Exit(1)
 		}
 
+		packFile := viper.GetString("pack-file")
+		if strings.TrimSpace(packFile) == "" {
+			packFile = "pack.toml"
+		}
+		var known struct{}
+		if metadata, decodeErr := toml.DecodeFile(packFile, &known); decodeErr == nil {
+			if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
+				keys := make([]string, 0, len(undecoded))
+				for _, key := range undecoded {
+					keys = append(keys, strings.Join(key, "."))
+				}
+				fmt.Printf("Warning: %s has key(s) this build does not know: %s\n", packFile, strings.Join(keys, ", "))
+				fmt.Println("         Rewriting pack.toml drops them; copy them somewhere safe first.")
+			}
+		}
+
 		pack.Sync = &lock
 		if err := pack.Write(); err != nil {
 			fmt.Println(err)
@@ -78,10 +95,12 @@ var lockInitCmd = &cobra.Command{
 			fmt.Println(err)
 			os.Exit(1)
 		}
+		before := len(index.Files)
 		if err := index.Refresh(); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
 		}
+		after := len(index.Files)
 		if err := index.Write(); err != nil {
 			fmt.Println(err)
 			os.Exit(1)
@@ -95,8 +114,18 @@ var lockInitCmd = &cobra.Command{
 			os.Exit(1)
 		}
 		fmt.Println()
+		fmt.Printf("Index entries after the refresh: %d\n", after)
+		if before > after {
+			fmt.Printf("Removed %d entr%s that were outside of the locked folders.\n", before-after, pluralY(before-after))
+		}
+		if before > 0 && after*10 < before {
+			fmt.Println("Note: most files were excluded. Clients will no longer receive them at all. If they also")
+			fmt.Println("      need folders like config, defaultconfigs, kubejs or resourcepacks, list them too:")
+			fmt.Println("      packwiz lock init mods config kubejs --force")
+		}
+		fmt.Println()
 		fmt.Println("Publish pack.toml AND index.toml together, then verify what clients will see with:")
-		fmt.Println("  packwiz lock check --url <the pack.toml URL> --preflight")
+		fmt.Println("  packwiz lock check --url \"https://your.host/pack.toml\" --preflight")
 		if index.HasStrictLockFailure() {
 			fmt.Println("The sync lock is in deny mode and rejected the paths listed above; failing the build.")
 			os.Exit(1)
@@ -154,6 +183,8 @@ var lockCheckJSON bool
 var lockCheckQuiet bool
 var lockCheckPreflight bool
 var lockCheckRequireLock bool
+var lockCheckAllowUnlocked bool
+var lockCheckPreflightLimit int
 var lockCheckWorkers int
 
 var lockCheckCmd = &cobra.Command{
@@ -166,8 +197,10 @@ var lockCheckCmd = &cobra.Command{
 		"--preflight goes one step further and downloads every file the pack lists, verifying its\n" +
 		"hash without writing anything. That reproduces the client's \"hash invalid\" failures on\n" +
 		"the authoring side.\n\n" +
+		"A pack without a [sync] lock is reported as NOT VERIFIED and fails, because there is\n" +
+		"nothing to check it against - use --allow-unlocked if you only want the other checks.\n\n" +
 		"A client can gate packwiz-installer with it:\n\n" +
-		"\tpackwiz lock check --url https://example.com/pack.toml --require-lock || exit 1\n" +
+		"\tpackwiz lock check --url https://example.com/pack.toml || exit 1\n" +
 		"\tjava -jar packwiz-installer-bootstrap.jar https://example.com/pack.toml",
 	Args: cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
@@ -272,8 +305,11 @@ func printLockCheckOutcome(outcome lockCheckOutcome) {
 
 		if outcome.missingLock {
 			fmt.Println()
-			fmt.Println("PROBLEM: this pack does not declare a [sync] lock, so it could write anywhere.")
-			fmt.Println("  Ask the pack author to run 'packwiz lock init mods'.")
+			fmt.Println("NOT VERIFIED: this pack does not declare a [sync] lock, so every file in it may be")
+			fmt.Println("  synced and there is nothing to check it against. packwiz-installer will happily")
+			fmt.Println("  download all of them, anywhere in the instance; 'packwiz sync' refuses such a pack.")
+			fmt.Println("  Fix it with 'packwiz lock init mods', then publish pack.toml AND index.toml.")
+			fmt.Println("  Pass --allow-unlocked if you only wanted the other checks.")
 		}
 
 		if !outcome.indexOK {
@@ -325,7 +361,11 @@ func printLockCheckOutcome(outcome lockCheckOutcome) {
 
 		if outcome.problems() == 0 {
 			fmt.Println()
-			fmt.Println("OK: this pack stays inside its locked folders and every file checks out.")
+			if outcome.lock.IsActive() {
+				fmt.Println("OK: this pack stays inside its locked folders and every file checks out.")
+			} else {
+				fmt.Println("Nothing was verified: this pack has no lock (--allow-unlocked was given).")
+			}
 		}
 	}
 
@@ -359,11 +399,18 @@ func finishLockCheck(plan core.InstallPlan, lock core.SyncLock, source string) {
 		indexOK:     plan.IndexHashOK(),
 		indexExpect: plan.IndexExpected,
 		indexActual: plan.IndexActual,
-		missingLock: lockCheckRequireLock && !lock.IsActive(),
+		missingLock: !lock.IsActive() && !lockCheckAllowUnlocked,
 	}
-	if lockCheckPreflight {
-		outcome.preflight = plan.RunPreflight(plan.Tasks, lockCheckWorkers)
-		outcome.preflighted = len(plan.Tasks)
+	if lockCheckPreflight && len(plan.Tasks) > 0 {
+		tasks := plan.Tasks
+		if lockCheckPreflightLimit > 0 && len(tasks) > lockCheckPreflightLimit {
+			tasks = tasks[:lockCheckPreflightLimit]
+		}
+		if !lockCheckQuiet && !lockCheckJSON {
+			fmt.Printf("Preflight: downloading %d file(s) to verify their hashes (use --preflight-limit to cap this)...\n", len(tasks))
+		}
+		outcome.preflight = plan.RunPreflight(tasks, lockCheckWorkers)
+		outcome.preflighted = len(tasks)
 	}
 	printLockCheckOutcome(outcome)
 }
@@ -389,8 +436,10 @@ func runLocalLockCheck() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	if lockCheckPreflight && !lockCheckQuiet && !lockCheckJSON {
-		fmt.Println("Note: checking local files only. Add --url to verify what clients actually download.")
+	if !lockCheckQuiet && !lockCheckJSON {
+		fmt.Println("Note: this checked the pack.toml on THIS machine. Use --url <URL> to check the copy")
+		fmt.Println("      that clients actually download; only that one decides what they install.")
+		fmt.Println()
 	}
 	location := core.NewDirPackLocation(viper.GetString("pack-file"))
 	plan := core.BuildInstallPlan(pack, index, location, lock, indexRaw)
@@ -454,6 +503,8 @@ func init() {
 	lockCheckCmd.Flags().BoolVar(&lockCheckJSON, "json", false, "Print the result as JSON")
 	lockCheckCmd.Flags().BoolVarP(&lockCheckQuiet, "quiet", "q", false, "Only exit with a non-zero status on failure")
 	lockCheckCmd.Flags().BoolVar(&lockCheckPreflight, "preflight", false, "Also download every file the pack lists and verify its hash")
-	lockCheckCmd.Flags().BoolVar(&lockCheckRequireLock, "require-lock", false, "Fail when the pack does not declare a [sync] lock")
+	lockCheckCmd.Flags().BoolVar(&lockCheckAllowUnlocked, "allow-unlocked", false, "Only warn when the pack has no [sync] lock (by default that is a failure)")
+	lockCheckCmd.Flags().BoolVar(&lockCheckRequireLock, "require-lock", false, "Deprecated: failing on an unlocked pack is now the default")
+	lockCheckCmd.Flags().IntVar(&lockCheckPreflightLimit, "preflight-limit", 0, "Verify at most this many files during --preflight (0 = all of them)")
 	lockCheckCmd.Flags().IntVar(&lockCheckWorkers, "workers", 8, "How many files to verify at the same time during --preflight")
 }
