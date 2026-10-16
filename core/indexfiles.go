@@ -19,6 +19,13 @@ type IndexPathHolder interface {
 	// getAliases returns every alias this entry installs to. Aliases are used as the
 	// destination path by packwiz-installer, so the sync lock has to check them too.
 	getAliases() []string
+	// getPrimaryAlias returns the alias the entry is installed to, or "" when it has none
+	getPrimaryAlias() string
+	// getHash and getHashFormat describe the expected content of the entry
+	getHash() string
+	getHashFormat() string
+	// isPreserve reports whether an existing file must be left alone
+	isPreserve() bool
 }
 
 // indexFile is a file in the index
@@ -60,6 +67,14 @@ func (i *indexFile) getAliases() []string {
 	}
 	return []string{i.Alias}
 }
+
+func (i *indexFile) getPrimaryAlias() string { return i.Alias }
+
+func (i *indexFile) getHash() string { return i.Hash }
+
+func (i *indexFile) getHashFormat() string { return i.HashFormat }
+
+func (i *indexFile) isPreserve() bool { return i.Preserve }
 
 type indexFileMultipleAlias map[string]indexFile
 
@@ -107,6 +122,34 @@ func (i *indexFileMultipleAlias) getAliases() []string {
 		}
 	}
 	return aliases
+}
+
+func (i *indexFileMultipleAlias) getPrimaryAlias() string {
+	for k := range *i {
+		return k
+	}
+	panic("No entries in indexFileMultipleAlias")
+}
+
+func (i *indexFileMultipleAlias) getHash() string {
+	for _, v := range *i {
+		return v.Hash
+	}
+	panic("No entries in indexFileMultipleAlias")
+}
+
+func (i *indexFileMultipleAlias) getHashFormat() string {
+	for _, v := range *i {
+		return v.HashFormat
+	}
+	panic("No entries in indexFileMultipleAlias")
+}
+
+func (i *indexFileMultipleAlias) isPreserve() bool {
+	for _, v := range *i {
+		return v.Preserve
+	}
+	panic("No entries in indexFileMultipleAlias")
 }
 
 // updateFileEntry updates the hash of a file and marks as found; adding it if it doesn't exist

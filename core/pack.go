@@ -94,6 +94,32 @@ func LoadPack() (Pack, error) {
 	return modpack, nil
 }
 
+// LoadPackFromBytes parses a pack.toml that was fetched from somewhere else, without touching
+// the local viper configuration. Used by "packwiz sync" when installing a remote pack.
+func LoadPackFromBytes(data []byte) (Pack, error) {
+	var modpack Pack
+	if _, err := toml.Decode(string(data), &modpack); err != nil {
+		return Pack{}, err
+	}
+	if len(modpack.PackFormat) == 0 {
+		modpack.PackFormat = CurrentPackFormat
+	}
+	if !strings.HasPrefix(modpack.PackFormat, "packwiz:") {
+		return Pack{}, errors.New("pack-format field does not indicate a valid packwiz pack")
+	}
+	ver, err := semver.StrictNewVersion(strings.TrimPrefix(modpack.PackFormat, "packwiz:"))
+	if err != nil {
+		return Pack{}, fmt.Errorf("pack-format field is not valid semver: %w", err)
+	}
+	if !PackFormatConstraintAccepted.Check(ver) {
+		return Pack{}, errors.New("the modpack is incompatible with this version of packwiz; please update")
+	}
+	if len(modpack.Index.File) == 0 {
+		modpack.Index.File = "index.toml"
+	}
+	return modpack, nil
+}
+
 // LoadIndex attempts to load the index file of this modpack
 func (pack Pack) LoadIndex() (Index, error) {
 	if filepath.IsAbs(pack.Index.File) {

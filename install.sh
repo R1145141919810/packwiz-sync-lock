@@ -270,8 +270,10 @@ if [ "\$#" -lt 1 ]; then
 fi
 PACK_URL="\$1"
 shift
-if ! "$target" lock check --url "\$PACK_URL" --quiet; then
-	echo "Refusing to install: the pack syncs files outside of the folders it locked." >&2
+# --require-lock makes an unlocked pack a hard failure.
+# Add --preflight to also download and hash every listed file first (slower, strictest).
+if ! "$target" lock check --url "\$PACK_URL" --quiet --require-lock; then
+	echo "Refusing to install: this pack is not inside the folders it locked." >&2
 	echo "Run '$target lock check --url \$PACK_URL' for the full report." >&2
 	exit 1
 fi

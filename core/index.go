@@ -56,6 +56,24 @@ func LoadIndex(indexFile string) (Index, error) {
 	return index, nil
 }
 
+// LoadIndexFromBytes parses an index that was fetched from somewhere instead of read from
+// disk. It is used for remote packs, where there is no local index file to point at.
+func LoadIndexFromBytes(data []byte, name string) (Index, error) {
+	var rep indexTomlRepresentation
+	if _, err := toml.Decode(string(data), &rep); err != nil {
+		return Index{}, err
+	}
+	if len(rep.HashFormat) == 0 {
+		rep.HashFormat = "sha256"
+	}
+	return Index{
+		HashFormat: rep.HashFormat,
+		Files:      rep.Files.toMemoryRep(),
+		indexFile:  name,
+		packRoot:   filepath.Dir(name),
+	}, nil
+}
+
 // RemoveFile removes a file from the index, given a file path
 func (in *Index) RemoveFile(path string) error {
 	relPath, err := in.RelIndexPath(path)
@@ -119,6 +137,9 @@ func (in *Index) updateFile(path string) error {
 
 	return in.updateFileHashGiven(path, "sha256", hashString, markAsMetaFile)
 }
+
+// IndexFilePath returns the OS path of the index file that was loaded.
+func (in Index) IndexFilePath() string { return in.indexFile }
 
 // ResolveIndexPath turns a path from the index into a file path on disk
 func (in Index) ResolveIndexPath(p string) string {
@@ -329,14 +350,62 @@ func (in *Index) lockReject(v SyncViolation) bool {
 // lockCheckMetafile verifies that a metadata file, and the file it installs, are both inside
 // the locked folders. This is the check that stops a metadata file declaring a filename such
 // as "../../options.txt" from writing outside of the locked folders.
-func (in *Index) lockCheckMetafile(relPath string, absPath string) (string, error) {
+func readMetaFilenameLocal(absPath string) (string, error) {
 	var meta struct {
 		Filename string `toml:"filename"`
 	}
 	if _, err := toml.DecodeFile(absPath, &meta); err != nil {
 		return "", fmt.Errorf("could not read metadata file: %w", err)
 	}
-	return in.Lock.CheckMetaDest(relPath, meta.Filename)
+	return meta.Filename, nil
+}
+
+func (in *Index) lockCheckMetafile(relPath string, absPath string) (string, error) {
+	filename, err := readMetaFilenameLocal(absPath)
+	if err != nil {
+		return "", err
+	}
+	return in.Lock.CheckMetaDest(relPath, filename)
+}
+
+// prunedCopy returns a copy of the index with every entry that the lock rejects removed,
+// together with the list of what was removed. It never modifies the receiver, which makes
+// it safe to use on the write path as well as during a refresh.
+func (in Index) prunedCopy(lock SyncLock) (Index, []SyncViolation) {
+	out := in
+	out.Files = make(IndexFiles, len(in.Files))
+	violations := []SyncViolation{}
+	for p, holder := range in.Files {
+		if err := lock.Check(string(p)); err != nil {
+			violations = append(violations, SyncViolation{Path: string(p), Reason: err.Error()})
+			continue
+		}
+		aliasReason := ""
+		for _, alias := range holder.getAliases() {
+			if err := lock.Check(alias); err != nil {
+				aliasReason = fmt.Sprintf("alias %q: %s", alias, err)
+				break
+			}
+		}
+		if aliasReason != "" {
+			violations = append(violations, SyncViolation{Path: string(p), Reason: aliasReason})
+			continue
+		}
+		if holder.IsMetaFile() {
+			filename, err := readMetaFilenameLocal(in.ResolveIndexPath(string(p)))
+			if err != nil {
+				violations = append(violations, SyncViolation{Path: string(p), Reason: err.Error()})
+				continue
+			}
+			dest, err := lock.CheckMetaDest(string(p), filename)
+			if err != nil {
+				violations = append(violations, SyncViolation{Path: string(p), Dest: dest, Reason: err.Error()})
+				continue
+			}
+		}
+		out.Files[p] = holder
+	}
+	return out, violations
 }
 
 // pruneLockViolations double checks every entry that is still in the index, including aliases.
@@ -344,23 +413,9 @@ func (in *Index) pruneLockViolations() {
 	if in.Lock == nil || in.Lock.ModeValue() == SyncModeWarn {
 		return
 	}
-	for p, file := range in.Files {
-		var reason string
-		if err := in.Lock.Check(string(p)); err != nil {
-			reason = err.Error()
-		} else {
-			for _, alias := range file.getAliases() {
-				if err := in.Lock.Check(alias); err != nil {
-					reason = fmt.Sprintf("alias %q: %s", alias, err)
-					break
-				}
-			}
-		}
-		if reason != "" {
-			in.LockViolations = append(in.LockViolations, SyncViolation{Path: string(p), Reason: reason})
-			delete(in.Files, p)
-		}
-	}
+	pruned, violations := in.prunedCopy(*in.Lock)
+	in.Files = pruned.Files
+	in.LockViolations = append(in.LockViolations, violations...)
 }
 
 // reportLockViolations prints a summary of everything the sync lock rejected.
@@ -376,18 +431,7 @@ func (in *Index) reportLockViolations() {
 		fmt.Printf("Sync lock: %s\n", lock.SyncLockDescription())
 		fmt.Printf("Excluded %d path(s) from the index:\n", len(in.LockViolations))
 	}
-	const maxPrinted = 25
-	for i, v := range in.LockViolations {
-		if i >= maxPrinted {
-			fmt.Printf("  ... and %d more (run 'packwiz lock show' for the configuration)\n", len(in.LockViolations)-maxPrinted)
-			break
-		}
-		label := v.Path
-		if v.Dest != "" {
-			label = fmt.Sprintf("%s -> %s", v.Path, v.Dest)
-		}
-		fmt.Printf("  - %s (%s)\n", label, v.Reason)
-	}
+	PrintSyncViolations(in.LockViolations, 25)
 }
 
 // HasStrictLockFailure reports whether the sync lock rejected something while running in
@@ -445,8 +489,54 @@ func (in Index) CheckLock(lock SyncLock) []SyncViolation {
 	return violations
 }
 
+// enforceLockOnWrite makes sure that an index which reaches the disk never points outside of
+// the locked folders.
+//
+// Refresh already enforces the lock, but a number of commands (modrinth add, url add, update,
+// pin, remove, ...) write the index straight back out without refreshing first. Enforcing here
+// as well means that none of them can publish an out-of-scope index by accident - which is
+// exactly how files outside of the lock used to end up in front of packwiz-installer.
+func (in Index) enforceLockOnWrite() Index {
+	lock, err := LoadSyncLock()
+	if err != nil || !lock.IsActive() || lock.ModeValue() == SyncModeWarn {
+		return in
+	}
+	enforced, violations := in.prunedCopy(lock)
+	if len(violations) == 0 {
+		return in
+	}
+	enforced.Lock = &lock
+	enforced.LockViolations = append(append([]SyncViolation{}, in.LockViolations...), violations...)
+
+	fmt.Printf("Sync lock: %s\n", lock.SyncLockDescription())
+	if len(in.LockViolations) > 0 {
+		fmt.Printf("Excluded %d more path(s) while writing the index:\n", len(violations))
+	} else {
+		fmt.Printf("Excluded %d path(s) from the index:\n", len(violations))
+	}
+	PrintSyncViolations(violations, 15)
+	return enforced
+}
+
+// PrintSyncViolations prints a capped list of lock violations.
+func PrintSyncViolations(violations []SyncViolation, maxPrinted int) {
+	for i, v := range violations {
+		if i >= maxPrinted {
+			fmt.Printf("  ... and %d more (run 'packwiz lock show' for the configuration)\n", len(violations)-maxPrinted)
+			break
+		}
+		label := v.Path
+		if v.Dest != "" {
+			label = fmt.Sprintf("%s -> %s", v.Path, v.Dest)
+		}
+		fmt.Printf("  - %s (%s)\n", label, v.Reason)
+	}
+}
+
 // Write saves the index file
 func (in Index) Write() error {
+	in = in.enforceLockOnWrite()
+
 	// Convert to indexTomlRepresentation
 	rep := indexTomlRepresentation{
 		HashFormat: in.HashFormat,

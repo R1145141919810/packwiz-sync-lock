@@ -3,14 +3,9 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/url"
 	"os"
-	"sort"
 	"strings"
-	"sync"
 
-	"github.com/BurntSushi/toml"
 	"github.com/packwiz/packwiz/core"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
@@ -31,7 +26,8 @@ var lockCmd = &cobra.Command{
 		"\t# refuse paths that try to leave the pack folder (\"..\", absolute paths, C:)\n" +
 		"\tblock-escapes = true\n\n" +
 		"packwiz-installer builds the list of files it downloads from index.toml alone, so keeping\n" +
-		"out-of-scope files out of index.toml is what makes the installer refuse to download them.",
+		"out-of-scope files out of index.toml is what makes the installer refuse to download them.\n" +
+		"'packwiz sync' enforces the same lock on the client side.",
 }
 
 var lockInitMode string
@@ -98,6 +94,9 @@ var lockInitCmd = &cobra.Command{
 			fmt.Println(err)
 			os.Exit(1)
 		}
+		fmt.Println()
+		fmt.Println("Publish pack.toml AND index.toml together, then verify what clients will see with:")
+		fmt.Println("  packwiz lock check --url <the pack.toml URL> --preflight")
 		if index.HasStrictLockFailure() {
 			fmt.Println("The sync lock is in deny mode and rejected the paths listed above; failing the build.")
 			os.Exit(1)
@@ -153,18 +152,23 @@ func enabledWord(enabled bool) string {
 var lockCheckURL string
 var lockCheckJSON bool
 var lockCheckQuiet bool
+var lockCheckPreflight bool
+var lockCheckRequireLock bool
+var lockCheckWorkers int
 
 var lockCheckCmd = &cobra.Command{
 	Use:   "check",
-	Short: "Verify that an index only holds files inside the locked folders (exits non-zero on failure)",
-	Long: "Verify that an index only holds files inside the locked folders.\n\n" +
-		"Without --url the pack in the current directory is checked. With --url a pack.toml is\n" +
-		"downloaded and checked remotely, which lets a client verify a pack before handing it to\n" +
-		"packwiz-installer:\n\n" +
-		"\tpackwiz lock check --url https://example.com/pack.toml || exit 1\n" +
-		"\tjava -jar packwiz-installer-bootstrap.jar https://example.com/pack.toml\n\n" +
-		"Every index entry, every alias and the destination declared by each metadata file is\n" +
-		"checked, so a pack cannot smuggle in \"../../options.txt\" or an absolute path.",
+	Short: "Verify a pack obeys its own lock (exits non-zero on failure)",
+	Long: "Verify that a pack only contains files inside the folders it locks.\n\n" +
+		"Without --url the pack in the current directory is checked. With --url the pack.toml is\n" +
+		"downloaded and checked exactly the way a client would see it, which is the only way to\n" +
+		"catch a stale index, a half-published pack or a file whose hash no longer matches.\n\n" +
+		"--preflight goes one step further and downloads every file the pack lists, verifying its\n" +
+		"hash without writing anything. That reproduces the client's \"hash invalid\" failures on\n" +
+		"the authoring side.\n\n" +
+		"A client can gate packwiz-installer with it:\n\n" +
+		"\tpackwiz lock check --url https://example.com/pack.toml --require-lock || exit 1\n" +
+		"\tjava -jar packwiz-installer-bootstrap.jar https://example.com/pack.toml",
 	Args: cobra.NoArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		if lockCheckURL != "" {
@@ -175,22 +179,84 @@ var lockCheckCmd = &cobra.Command{
 	},
 }
 
-type lockCheckReport struct {
-	OK         bool                 "json:\"ok\""
-	Source     string               "json:\"source\""
-	Checked    int                  "json:\"checked\""
-	Lock       core.SyncLock        "json:\"lock\""
-	Violations []core.SyncViolation "json:\"violations\""
+type lockCheckOutcome struct {
+	lock        core.SyncLock
+	source      string
+	packName    string
+	checked     int
+	violations  []core.SyncViolation
+	emptyHashes []string
+	indexOK     bool
+	indexExpect string
+	indexActual string
+	preflight   []core.PreflightResult
+	preflighted int
+	missingLock bool
 }
 
-func printLockCheckResult(lock core.SyncLock, source string, checked int, violations []core.SyncViolation) {
+type preflightReport struct {
+	Path  string "json:\"path\""
+	Dest  string "json:\"dest\""
+	Error string "json:\"error\""
+}
+
+func (o lockCheckOutcome) problems() int {
+	count := len(o.violations) + len(o.emptyHashes)
+	if !o.indexOK {
+		count++
+	}
+	if o.missingLock {
+		count++
+	}
+	for _, result := range o.preflight {
+		if result.Error != nil {
+			count++
+		}
+	}
+	return count
+}
+
+func printLockCheckOutcome(outcome lockCheckOutcome) {
+	failures := make([]preflightReport, 0)
+	for _, result := range outcome.preflight {
+		if result.Error != nil {
+			failures = append(failures, preflightReport{
+				Path:  result.Task.IndexPath,
+				Dest:  result.Task.Dest,
+				Error: result.Error.Error(),
+			})
+		}
+	}
+
 	if lockCheckJSON {
-		payload := lockCheckReport{
-			OK:         len(violations) == 0,
-			Source:     source,
-			Checked:    checked,
-			Lock:       lock,
-			Violations: violations,
+		payload := struct {
+			OK            bool                 "json:\"ok\""
+			Source        string               "json:\"source\""
+			Pack          string               "json:\"pack\""
+			Checked       int                  "json:\"checked\""
+			Lock          core.SyncLock        "json:\"lock\""
+			LockMissing   bool                 "json:\"lock_missing\""
+			IndexHashOK   bool                 "json:\"index_hash_ok\""
+			IndexExpected string               "json:\"index_hash_expected,omitempty\""
+			IndexActual   string               "json:\"index_hash_actual,omitempty\""
+			Violations    []core.SyncViolation "json:\"violations\""
+			EmptyHashes   []string             "json:\"entries_without_hash,omitempty\""
+			Preflighted   int                  "json:\"preflighted\""
+			Preflight     []preflightReport    "json:\"preflight_failures,omitempty\""
+		}{
+			OK:            outcome.problems() == 0,
+			Source:        outcome.source,
+			Pack:          outcome.packName,
+			Checked:       outcome.checked,
+			Lock:          outcome.lock,
+			LockMissing:   outcome.missingLock,
+			IndexHashOK:   outcome.indexOK,
+			IndexExpected: outcome.indexExpect,
+			IndexActual:   outcome.indexActual,
+			Violations:    outcome.violations,
+			EmptyHashes:   outcome.emptyHashes,
+			Preflighted:   outcome.preflighted,
+			Preflight:     failures,
 		}
 		encoded, err := json.MarshalIndent(payload, "", "  ")
 		if err != nil {
@@ -199,23 +265,71 @@ func printLockCheckResult(lock core.SyncLock, source string, checked int, violat
 		}
 		fmt.Println(string(encoded))
 	} else if !lockCheckQuiet {
-		fmt.Println("Sync lock: " + lock.SyncLockDescription())
-		fmt.Printf("Checked %d index entr%s of %s\n", checked, pluralY(checked), source)
-		if len(violations) == 0 {
-			fmt.Println("OK: everything in the index is inside the locked folders.")
-		} else {
-			fmt.Printf("FAILED: %d path(s) violate the lock:\n", len(violations))
-			for _, v := range violations {
-				label := v.Path
-				if v.Dest != "" && v.Dest != v.Path {
-					label = fmt.Sprintf("%s -> %s", v.Path, v.Dest)
+		fmt.Println("Pack: " + outcome.packName)
+		fmt.Println("Source: " + outcome.source)
+		fmt.Println("Sync lock: " + outcome.lock.SyncLockDescription())
+		fmt.Printf("Checked %d index entr%s\n", outcome.checked, pluralY(outcome.checked))
+
+		if outcome.missingLock {
+			fmt.Println()
+			fmt.Println("PROBLEM: this pack does not declare a [sync] lock, so it could write anywhere.")
+			fmt.Println("  Ask the pack author to run 'packwiz lock init mods'.")
+		}
+
+		if !outcome.indexOK {
+			fmt.Println()
+			fmt.Println("PROBLEM: index.toml does not match the hash recorded in pack.toml.")
+			fmt.Printf("  pack.toml says      : %s\n", outcome.indexExpect)
+			fmt.Printf("  the served index is : %s\n", outcome.indexActual)
+			fmt.Println("  Clients abort with 'Your index file hash is invalid!'. Publish pack.toml and")
+			fmt.Println("  index.toml together, after running 'packwiz refresh'.")
+		}
+
+		if len(outcome.violations) > 0 {
+			fmt.Println()
+			fmt.Printf("PROBLEM: %d path(s) are outside of the locked folders:\n", len(outcome.violations))
+			core.PrintSyncViolations(outcome.violations, 25)
+			fmt.Println("  packwiz-installer would download these; 'packwiz sync' refuses them.")
+		}
+
+		if len(outcome.emptyHashes) > 0 {
+			fmt.Println()
+			fmt.Printf("PROBLEM: %d entr(y/ies) have no hash recorded:\n", len(outcome.emptyHashes))
+			for i, entry := range outcome.emptyHashes {
+				if i >= 10 {
+					fmt.Printf("  ... and %d more\n", len(outcome.emptyHashes)-10)
+					break
 				}
-				fmt.Printf("  - %s (%s)\n", label, v.Reason)
+				fmt.Println("  - " + entry)
 			}
+			fmt.Println("  Clients report 'hash invalid!' for these. This happens when a pack is published")
+			fmt.Println("  with no-internal-hashes enabled; run 'packwiz refresh --build' before publishing.")
+		}
+
+		if outcome.preflighted > 0 {
+			fmt.Println()
+			if len(failures) == 0 {
+				fmt.Printf("Preflight: all %d file(s) downloaded and matched their recorded hash.\n", outcome.preflighted)
+			} else {
+				fmt.Printf("PROBLEM: %d of %d file(s) failed the preflight:\n", len(failures), outcome.preflighted)
+				for i, failure := range failures {
+					if i >= 25 {
+						fmt.Printf("  ... and %d more\n", len(failures)-25)
+						break
+					}
+					fmt.Printf("  - %s -> %s: %s\n", failure.Path, failure.Dest, failure.Error)
+				}
+				fmt.Println("  Clients fail to install these files.")
+			}
+		}
+
+		if outcome.problems() == 0 {
+			fmt.Println()
+			fmt.Println("OK: this pack stays inside its locked folders and every file checks out.")
 		}
 	}
 
-	if len(violations) > 0 {
+	if outcome.problems() > 0 {
 		os.Exit(1)
 	}
 }
@@ -225,6 +339,33 @@ func pluralY(n int) string {
 		return "y"
 	}
 	return "ies"
+}
+
+func normalizePackLock(pack core.Pack) (core.SyncLock, error) {
+	if pack.Sync == nil {
+		return core.SyncLock{}, nil
+	}
+	return pack.Sync.Normalize()
+}
+
+func finishLockCheck(plan core.InstallPlan, lock core.SyncLock, source string) {
+	outcome := lockCheckOutcome{
+		lock:        lock,
+		source:      source,
+		packName:    plan.Pack.Name,
+		checked:     len(plan.Index.Files),
+		violations:  plan.Violations,
+		emptyHashes: plan.EmptyHashes,
+		indexOK:     plan.IndexHashOK(),
+		indexExpect: plan.IndexExpected,
+		indexActual: plan.IndexActual,
+		missingLock: lockCheckRequireLock && !lock.IsActive(),
+	}
+	if lockCheckPreflight {
+		outcome.preflight = plan.RunPreflight(plan.Tasks, lockCheckWorkers)
+		outcome.preflighted = len(plan.Tasks)
+	}
+	printLockCheckOutcome(outcome)
 }
 
 func runLocalLockCheck() {
@@ -238,179 +379,65 @@ func runLocalLockCheck() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
+	indexRaw, err := os.ReadFile(index.IndexFilePath())
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 	lock, err := core.LoadSyncLock()
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	violations := index.CheckLock(lock)
+	if lockCheckPreflight && !lockCheckQuiet && !lockCheckJSON {
+		fmt.Println("Note: checking local files only. Add --url to verify what clients actually download.")
+	}
+	location := core.NewDirPackLocation(viper.GetString("pack-file"))
+	plan := core.BuildInstallPlan(pack, index, location, lock, indexRaw)
 	source := viper.GetString("pack-file")
 	if strings.TrimSpace(source) == "" {
 		source = "pack.toml"
 	}
-	printLockCheckResult(lock, source, len(index.Files), violations)
-}
-
-type remotePackFile struct {
-	Index struct {
-		File string "toml:\"file\""
-	} "toml:\"index\""
-	Sync core.SyncLock "toml:\"sync\""
-}
-
-type remoteIndexFileEntry struct {
-	File     string "toml:\"file\""
-	Alias    string "toml:\"alias\""
-	MetaFile bool   "toml:\"metafile\""
-}
-
-type remoteIndexFile struct {
-	Files []remoteIndexFileEntry "toml:\"files\""
-}
-
-type remoteMetaFile struct {
-	Filename string "toml:\"filename\""
-}
-
-func fetchPackTOML(u string, out interface{}) ([]byte, error) {
-	resp, err := core.GetWithUA(u, "text/plain, application/toml, */*")
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch %s: %w", u, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("failed to fetch %s: HTTP %d", u, resp.StatusCode)
-	}
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch %s: %w", u, err)
-	}
-	if _, err := toml.Decode(string(raw), out); err != nil {
-		return nil, fmt.Errorf("failed to parse %s: %w", u, err)
-	}
-	return raw, nil
-}
-
-// resolvePackURL resolves a pack-relative path against the URL the pack.toml was fetched from.
-func resolvePackURL(base *url.URL, rel string) (string, error) {
-	rel = strings.TrimPrefix(strings.ReplaceAll(rel, "\\", "/"), "/")
-	cleanBase := *base
-	cleanBase.RawQuery = ""
-	cleanBase.Fragment = ""
-	ref := &url.URL{Path: rel}
-	return cleanBase.ResolveReference(ref).String(), nil
+	finishLockCheck(plan, lock, source)
 }
 
 func runRemoteLockCheck(packURL string) {
-	base, err := url.Parse(packURL)
-	if err != nil {
-		fmt.Printf("Invalid pack URL: %s\n", err)
-		os.Exit(1)
-	}
-
-	var packFile remotePackFile
-	raw, err := fetchPackTOML(packURL, &packFile)
+	location, err := core.NewURLPackLocation(packURL)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-
-	var generic map[string]interface{}
-	if _, err := toml.Decode(string(raw), &generic); err != nil {
-		fmt.Printf("Failed to parse %s: %s\n", packURL, err)
+	packData, err := location.ReadAll("")
+	if err != nil {
+		fmt.Printf("Could not download %s: %s\n", packURL, err)
 		os.Exit(1)
 	}
-	lock, err := packFile.Sync.Normalize()
+	pack, err := core.LoadPackFromBytes(packData)
+	if err != nil {
+		fmt.Printf("Could not read %s: %s\n", packURL, err)
+		os.Exit(1)
+	}
+	lock, err := normalizePackLock(pack)
 	if err != nil {
 		fmt.Printf("%s: %s\n", packURL, err)
 		os.Exit(1)
 	}
-	if _, hasSync := generic["sync"]; hasSync && len(lock.AllowedPaths) == 0 && lock.ModeValue() != core.SyncModeOff {
-		fmt.Printf("%s: the [sync] table does not allow any folder; refusing to check an empty lock\n", packURL)
-		os.Exit(1)
+	indexRel := strings.TrimSpace(pack.Index.File)
+	if indexRel == "" {
+		indexRel = "index.toml"
 	}
-	if !lock.IsActive() {
-		if !lockCheckQuiet {
-			fmt.Println("This pack does not declare a sync lock, so there is nothing to verify.")
-		}
-		printLockCheckResult(lock, packURL, 0, []core.SyncViolation{})
-		return
-	}
-
-	indexFile := packFile.Index.File
-	if strings.TrimSpace(indexFile) == "" {
-		indexFile = "index.toml"
-	}
-	indexURL, err := resolvePackURL(base, indexFile)
+	indexRaw, err := location.ReadAll(indexRel)
 	if err != nil {
-		fmt.Printf("Failed to resolve the index URL: %s\n", err)
+		fmt.Printf("Could not download %s: %s\n", location.Resolve(indexRel), err)
 		os.Exit(1)
 	}
-
-	var index remoteIndexFile
-	if _, err := fetchPackTOML(indexURL, &index); err != nil {
-		fmt.Println(err)
+	index, err := core.LoadIndexFromBytes(indexRaw, indexRel)
+	if err != nil {
+		fmt.Printf("Could not read %s: %s\n", location.Resolve(indexRel), err)
 		os.Exit(1)
 	}
-
-	violations := []core.SyncViolation{}
-	metafilesToCheck := make([]remoteIndexFileEntry, 0)
-
-	for _, entry := range index.Files {
-		if err := lock.Check(entry.File); err != nil {
-			violations = append(violations, core.SyncViolation{Path: entry.File, Reason: err.Error()})
-			continue
-		}
-		if entry.Alias != "" {
-			if err := lock.Check(entry.Alias); err != nil {
-				violations = append(violations, core.SyncViolation{
-					Path:   entry.File,
-					Reason: fmt.Sprintf("alias %q: %s", entry.Alias, err),
-				})
-			}
-		}
-		if entry.MetaFile {
-			metafilesToCheck = append(metafilesToCheck, entry)
-		}
-	}
-
-	// Fetch the metadata files concurrently; each one declares the real download destination
-	var mu sync.Mutex
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, 8)
-	for _, entry := range metafilesToCheck {
-		wg.Add(1)
-		go func(entry remoteIndexFileEntry) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			metaURL, err := resolvePackURL(base, entry.File)
-			if err != nil {
-				mu.Lock()
-				violations = append(violations, core.SyncViolation{Path: entry.File, Reason: err.Error()})
-				mu.Unlock()
-				return
-			}
-			var meta remoteMetaFile
-			if _, err := fetchPackTOML(metaURL, &meta); err != nil {
-				mu.Lock()
-				violations = append(violations, core.SyncViolation{Path: entry.File, Reason: err.Error()})
-				mu.Unlock()
-				return
-			}
-			dest, err := lock.CheckMetaDest(entry.File, meta.Filename)
-			if err != nil {
-				mu.Lock()
-				violations = append(violations, core.SyncViolation{Path: entry.File, Dest: dest, Reason: err.Error()})
-				mu.Unlock()
-			}
-		}(entry)
-	}
-	wg.Wait()
-
-	sort.Slice(violations, func(i, j int) bool { return violations[i].Path < violations[j].Path })
-	printLockCheckResult(lock, indexURL, len(index.Files), violations)
+	plan := core.BuildInstallPlan(pack, index, location, lock, indexRaw)
+	finishLockCheck(plan, lock, location.Resolve(indexRel))
 }
 
 func init() {
@@ -426,4 +453,7 @@ func init() {
 	lockCheckCmd.Flags().StringVar(&lockCheckURL, "url", "", "Check a remote pack.toml instead of the pack in the current directory")
 	lockCheckCmd.Flags().BoolVar(&lockCheckJSON, "json", false, "Print the result as JSON")
 	lockCheckCmd.Flags().BoolVarP(&lockCheckQuiet, "quiet", "q", false, "Only exit with a non-zero status on failure")
+	lockCheckCmd.Flags().BoolVar(&lockCheckPreflight, "preflight", false, "Also download every file the pack lists and verify its hash")
+	lockCheckCmd.Flags().BoolVar(&lockCheckRequireLock, "require-lock", false, "Fail when the pack does not declare a [sync] lock")
+	lockCheckCmd.Flags().IntVar(&lockCheckWorkers, "workers", 8, "How many files to verify at the same time during --preflight")
 }
