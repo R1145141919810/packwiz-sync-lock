@@ -1,0 +1,24 @@
+packwiz-sync-lock
+===============
+
+This project is a derivative work of packwiz:
+
+    https://github.com/packwiz/packwiz
+    License: MIT
+
+The upstream source is included in this repository (see the git history).
+Files that are unchanged from upstream remain under the upstream copyright
+notice; upstream's MIT license text is reproduced in LICENSE.
+
+Modifications added by this project
+-----------------------------------
+  * sync lock        - a [sync] table in pack.toml, enforced whenever an index
+                       is written, so out-of-scope files never reach
+                       index.toml (core/synclock.go, core/index.go)
+  * modrinth scanner - "packwiz modrinth scan" turns local files into Modrinth
+                       metadata (modrinth/scan.go)
+  * client enforcer  - "packwiz sync" and "packwiz lock check --preflight"
+                       (cmd/sync.go, cmd/lock.go, core/installplan.go)
+
+Copyright (c) 2026 R1145141919810
+Licensed under the MIT License - see LICENSE.
