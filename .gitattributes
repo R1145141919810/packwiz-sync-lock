@@ -1,1 +1,14 @@
-*.go text eol=lf
+# Keep the repository byte-identical everywhere: this project ships shell scripts
+# (install.sh) and CI definitions, and CRLF would break them on Linux/macOS.
+* text=auto eol=lf
+
+*.go   text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.toml text eol=lf
+
+*.exe  binary
+*.jar  binary
+*.png  binary
