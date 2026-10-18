@@ -1,6 +1,6 @@
 #!/bin/sh
 # =============================================================================
-#  packwiz "sync-lock" edition - one-click installer
+#  packwiz-sync-lock installer  (github.com/R1145141919810/packwiz-sync-lock)
 #
 #  Installs the patched packwiz binary for this machine.
 #  If packwiz is already installed, the existing binary is backed up and
@@ -35,7 +35,20 @@ die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 usage() {
-	sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+	if [ -r "$0" ]; then
+		sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+	else
+		echo "packwiz sync-lock installer $INSTALLER_VERSION"
+		echo ""
+		echo "Usage: install.sh [options]"
+		echo "  --prefix DIR          install into DIR/bin when no packwiz exists yet"
+		echo "  --bin-dir DIR         take the binaries from DIR"
+		echo "  --base-url URL        download the binaries from URL (default: GitHub releases)"
+		echo "  --installer-jar FILE  also install packwiz-installer-guarded"
+		echo "  --no-replace          never touch an existing packwiz"
+		echo "  --dry-run             only show what would happen"
+		echo "  --version             print the installer version"
+	fi
 }
 
 cleanup() {
@@ -130,6 +143,11 @@ find_local_binary() {
 	return 1
 }
 
+# Fall back to the published release assets when there is no local binary
+if [ -z "$BASE_URL" ]; then
+	BASE_URL="https://github.com/R1145141919810/packwiz-sync-lock/releases/latest/download"
+fi
+
 src=""
 if src=$(find_local_binary); then
 	say "Using bundled binary: $src"
@@ -152,7 +170,7 @@ elif [ -n "$BASE_URL" ]; then
 		fi
 	fi
 else
-	die "no binary for $os/$arch next to this script; pass --base-url or --bin-dir"
+	die "no binary for $os/$arch found; pass --base-url or --bin-dir"
 fi
 
 if [ ! -f "$src" ]; then
