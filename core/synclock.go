@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/spf13/viper"
@@ -43,6 +44,37 @@ type SyncLock struct {
 	BlockEscapes *bool `toml:"block-escapes,omitempty"`
 	// Note is an optional free-form comment, shown by "packwiz lock show".
 	Note string `toml:"note,omitempty"`
+	// Download is the optional [sync.download] table, which decides what a client does when a
+	// mod host is slow or unreachable.
+	Download SyncDownloadPolicy `toml:"download,omitempty"`
+}
+
+// SyncDownloadPolicy is the [sync.download] table of pack.toml.
+//
+//	[sync.download]
+//	# fall back to the pack server when Modrinth/CurseForge is unreachable or serves the wrong file
+//	fallback-to-server = true
+//	# give up on a single download after this many seconds
+//	timeout = 60
+type SyncDownloadPolicy struct {
+	// FallbackToServer makes the client download a file from the pack server, at the same
+	// path it would be installed to, when the mod host fails. Defaults to true.
+	FallbackToServer *bool `toml:"fallback-to-server,omitempty"`
+	// TimeoutSeconds bounds one download attempt before the fallback is tried. Defaults to 60.
+	TimeoutSeconds int `toml:"timeout,omitempty"`
+}
+
+// FallbackEnabled reports whether clients may fall back to the pack server.
+func (p SyncDownloadPolicy) FallbackEnabled() bool {
+	return p.FallbackToServer == nil || *p.FallbackToServer
+}
+
+// Timeout is how long a single download may take before the fallback is tried.
+func (p SyncDownloadPolicy) Timeout() time.Duration {
+	if p.TimeoutSeconds <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(p.TimeoutSeconds) * time.Second
 }
 
 // SyncViolation records a single path that the lock rejected.

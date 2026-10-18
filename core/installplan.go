@@ -9,8 +9,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/BurntSushi/toml"
+	"github.com/packwiz/packwiz/cfapi"
 )
 
 // installMetaFile is the part of a metadata (.pw.toml) file that a client needs in order to
@@ -30,6 +32,16 @@ type installMetaFile struct {
 		Default     bool   `toml:"default"`
 		Description string `toml:"description"`
 	} `toml:"option"`
+	// Update carries the per-source update blocks, e.g. [update.curseforge] file-id.
+	Update map[string]installMetaUpdate `toml:"update"`
+}
+
+// installMetaUpdate is one [update.<source>] table of a metadata file.
+type installMetaUpdate struct {
+	FileID    int    `toml:"file-id"`
+	ProjectID int    `toml:"project-id"`
+	ModID     string `toml:"mod-id"`
+	Version   string `toml:"version"`
 }
 
 // InstallTask is a single file that a client has to place.
@@ -44,6 +56,9 @@ type InstallTask struct {
 	Side       string
 	Optional   bool
 	Preserve   bool
+	// CurseForgeFileID is set for "metadata:curseforge" entries. Their download URL is
+	// resolved through the CurseForge API at download time, exactly like packwiz-installer.
+	CurseForgeFileID int
 }
 
 // InstallPlan is everything a client has to do in order to install a pack.
@@ -56,6 +71,12 @@ type InstallPlan struct {
 	Violations    []SyncViolation
 	IndexExpected string
 	IndexActual   string
+	// FallbackToServer makes the client fall back to the pack server (same path as the
+	// destination) when the mod host is unreachable, times out, or serves a wrong file.
+	FallbackToServer bool
+	// DownloadTimeout bounds a single download attempt before the fallback is tried.
+	DownloadTimeout time.Duration
+	cf              *cfResolver
 	// EmptyHashes lists entries a client can never verify, which is what makes
 	// packwiz-installer fail with "hash invalid". It is almost always caused by
 	// no-internal-hashes being enabled while the pack was published.
@@ -81,6 +102,9 @@ func BuildInstallPlan(pack Pack, index Index, loc PackLocation, lock SyncLock, i
 		Violations:  []SyncViolation{},
 		EmptyHashes: []string{},
 	}
+	plan.FallbackToServer = lock.Download.FallbackEnabled()
+	plan.DownloadTimeout = lock.Download.Timeout()
+	plan.cf = &cfResolver{timeout: plan.DownloadTimeout}
 
 	indexFormat := pack.Index.HashFormat
 	if strings.TrimSpace(indexFormat) == "" {
@@ -211,17 +235,33 @@ func BuildInstallPlan(pack Pack, index Index, loc PackLocation, lock SyncLock, i
 		if alias != "" {
 			dest = alias
 		}
-		if mode := strings.TrimSpace(meta.Download.Mode); mode != "" && mode != ModeURL {
+		curseForgeFileID := 0
+		mode := strings.TrimSpace(meta.Download.Mode)
+		switch {
+		case mode == "" || mode == ModeURL:
+			if strings.TrimSpace(meta.Download.URL) == "" {
+				plan.Violations = append(plan.Violations, SyncViolation{
+					Path:   p,
+					Reason: "the metadata file does not have a download URL",
+				})
+				continue
+			}
+		case mode == ModeCF:
+			// CurseForge entries carry a file ID instead of a URL; the client resolves it
+			// through the CurseForge API, which is what packwiz-installer does too.
+			update, ok := meta.Update["curseforge"]
+			if !ok || update.FileID == 0 {
+				plan.Violations = append(plan.Violations, SyncViolation{
+					Path:   p,
+					Reason: "the metadata file uses the CurseForge download mode but has no [update.curseforge] file-id",
+				})
+				continue
+			}
+			curseForgeFileID = update.FileID
+		default:
 			plan.Violations = append(plan.Violations, SyncViolation{
 				Path:   p,
-				Reason: fmt.Sprintf("download mode %q needs packwiz-installer (run 'packwiz update' to rewrite this file)", mode),
-			})
-			continue
-		}
-		if strings.TrimSpace(meta.Download.URL) == "" {
-			plan.Violations = append(plan.Violations, SyncViolation{
-				Path:   p,
-				Reason: "the metadata file does not have a download URL",
+				Reason: fmt.Sprintf("download mode %q is not supported (run 'packwiz update' to rewrite this file)", mode),
 			})
 			continue
 		}
@@ -237,18 +277,56 @@ func BuildInstallPlan(pack Pack, index Index, loc PackLocation, lock SyncLock, i
 			name = dest
 		}
 		plan.Tasks = append(plan.Tasks, InstallTask{
-			IndexPath:  p,
-			Dest:       dest,
-			Name:       name,
-			HashFormat: downloadFormat,
-			Hash:       meta.Download.Hash,
-			SourceURL:  meta.Download.URL,
-			Side:       meta.Side,
-			Optional:   meta.Option.Optional,
-			Preserve:   holder.isPreserve(),
+			IndexPath:        p,
+			Dest:             dest,
+			Name:             name,
+			HashFormat:       downloadFormat,
+			Hash:             meta.Download.Hash,
+			SourceURL:        meta.Download.URL,
+			Side:             meta.Side,
+			Optional:         meta.Option.Optional,
+			Preserve:         holder.isPreserve(),
+			CurseForgeFileID: curseForgeFileID,
 		})
 	}
+	plan.cf.fileIDs = collectCurseForgeIDs(plan.Tasks)
 	return plan
+}
+
+// collectCurseForgeIDs returns every distinct CurseForge file ID a plan needs.
+func collectCurseForgeIDs(tasks []InstallTask) []int {
+	seen := make(map[int]bool, len(tasks))
+	ids := make([]int, 0, len(tasks))
+	for _, task := range tasks {
+		if task.CurseForgeFileID != 0 && !seen[task.CurseForgeFileID] {
+			seen[task.CurseForgeFileID] = true
+			ids = append(ids, task.CurseForgeFileID)
+		}
+	}
+	return ids
+}
+
+// cfResolver resolves CurseForge file IDs once per plan and caches the answers.
+type cfResolver struct {
+	once    sync.Once
+	fileIDs []int
+	timeout time.Duration
+	files   map[int]cfapi.FileInfo
+	err     error
+}
+
+func (r *cfResolver) get(fileID int) (cfapi.FileInfo, error) {
+	r.once.Do(func() {
+		r.files, r.err = cfapi.ResolveFiles(r.fileIDs, r.timeout)
+	})
+	if r.err != nil {
+		return cfapi.FileInfo{}, r.err
+	}
+	file, ok := r.files[fileID]
+	if !ok {
+		return cfapi.FileInfo{}, fmt.Errorf("the CurseForge API did not return file %d", fileID)
+	}
+	return file, nil
 }
 
 // checkClientPath validates a pack-relative path for a client: it must stay inside the pack
@@ -306,6 +384,11 @@ type InstallOutcome struct {
 	Skipped    bool
 	SkipReason string
 	Error      error
+	// FallbackUsed is true when the mod host could not be used and the file came from the
+	// pack server instead.
+	FallbackUsed bool
+	// FallbackReason explains why the mod host was not used.
+	FallbackReason error
 }
 
 // ApplyTask downloads a task, verifies its hash and writes it below targetDir.
@@ -339,21 +422,83 @@ func (p InstallPlan) ApplyTask(task InstallTask, targetDir string, dryRun bool) 
 		return outcome
 	}
 
-	source, err := p.OpenTaskSource(task)
-	if err != nil {
-		outcome.Error = fmt.Errorf("could not download %s: %w", p.DescribeTaskSource(task), err)
+	// Try the mod host first (Modrinth/CurseForge), then fall back to the pack server.
+	primaryOpen, primaryDescription, primaryErr := p.primarySource(task)
+	var downloadErr error
+	if primaryErr != nil {
+		downloadErr = primaryErr
+	} else {
+		downloadErr = p.downloadInto(destAbs, format, task.Hash, primaryOpen, primaryDescription)
+	}
+	if downloadErr == nil {
+		outcome.Written = true
 		return outcome
+	}
+
+	if p.FallbackToServer {
+		fallbackOpen := func() (io.ReadCloser, error) { return p.Location.Open(task.Dest) }
+		fallbackErr := p.downloadInto(destAbs, format, task.Hash, fallbackOpen, p.Location.Resolve(task.Dest))
+		if fallbackErr == nil {
+			outcome.Written = true
+			outcome.FallbackUsed = true
+			outcome.FallbackReason = downloadErr
+			return outcome
+		}
+		outcome.Error = fmt.Errorf("%s (the fallback to the pack server also failed: %s)", downloadErr, fallbackErr)
+		return outcome
+	}
+	outcome.Error = downloadErr
+	return outcome
+}
+
+// SetDownloadPolicy overrides how downloads are attempted, after a plan has been built.
+func (p *InstallPlan) SetDownloadPolicy(fallback bool, timeout time.Duration) {
+	p.FallbackToServer = fallback
+	p.DownloadTimeout = timeout
+	if p.cf != nil {
+		p.cf.timeout = timeout
+	}
+}
+
+// primarySource returns the opener, a description and any preparation error for the source the
+// pack prefers: a plain download URL, a CurseForge file, or the pack itself.
+func (p InstallPlan) primarySource(task InstallTask) (func() (io.ReadCloser, error), string, error) {
+	if strings.TrimSpace(task.SourceURL) != "" {
+		url := task.SourceURL
+		return func() (io.ReadCloser, error) { return OpenURLWithTimeout(url, p.DownloadTimeout) }, url, nil
+	}
+	if task.CurseForgeFileID != 0 {
+		if p.cf == nil {
+			return nil, "", fmt.Errorf("CurseForge metadata cannot be resolved in this context")
+		}
+		file, err := p.cf.get(task.CurseForgeFileID)
+		if err != nil {
+			return nil, "", fmt.Errorf("could not resolve CurseForge file %d: %w", task.CurseForgeFileID, err)
+		}
+		if file.DownloadURL == nil || strings.TrimSpace(*file.DownloadURL) == "" {
+			return nil, "", fmt.Errorf("CurseForge file %d has no download URL (the author disabled third party downloads)", task.CurseForgeFileID)
+		}
+		url := *file.DownloadURL
+		return func() (io.ReadCloser, error) { return OpenURLWithTimeout(url, p.DownloadTimeout) }, url, nil
+	}
+	rel := task.SourceRel
+	return func() (io.ReadCloser, error) { return p.Location.Open(rel) }, p.Location.Resolve(rel), nil
+}
+
+// downloadInto streams one source into destAbs and verifies it against the expected hash.
+func (p InstallPlan) downloadInto(destAbs string, format string, expected string, open func() (io.ReadCloser, error), description string) error {
+	source, err := open()
+	if err != nil {
+		return fmt.Errorf("could not download %s: %w", description, err)
 	}
 	defer source.Close()
 
 	if err := os.MkdirAll(filepath.Dir(destAbs), 0755); err != nil {
-		outcome.Error = err
-		return outcome
+		return err
 	}
 	tempFile, err := os.CreateTemp(filepath.Dir(destAbs), ".packwiz-sync-*.tmp")
 	if err != nil {
-		outcome.Error = err
-		return outcome
+		return err
 	}
 	tempPath := tempFile.Name()
 	discardTemp := func() {
@@ -364,25 +509,21 @@ func (p InstallPlan) ApplyTask(task InstallTask, targetDir string, dryRun bool) 
 	hasher, err := GetHashImpl(format)
 	if err != nil {
 		discardTemp()
-		outcome.Error = err
-		return outcome
+		return err
 	}
 	if _, err := io.Copy(io.MultiWriter(tempFile, hasher), source); err != nil {
 		discardTemp()
-		outcome.Error = fmt.Errorf("failed while downloading %s: %w", p.DescribeTaskSource(task), err)
-		return outcome
+		return fmt.Errorf("failed while downloading %s: %w", description, err)
 	}
 	actual := hasher.HashToString(hasher.Sum(nil))
-	if task.Hash != "" && !strings.EqualFold(actual, task.Hash) {
+	if expected != "" && !strings.EqualFold(actual, expected) {
 		discardTemp()
-		outcome.Error = fmt.Errorf("hash invalid for %s: the downloaded file hashes to %s %s but the pack expects %s (source: %s)",
-			task.Dest, format, actual, task.Hash, p.DescribeTaskSource(task))
-		return outcome
+		return fmt.Errorf("hash invalid: %s served a file that hashes to %s %s, but the pack expects %s",
+			description, format, actual, expected)
 	}
 	if err := tempFile.Close(); err != nil {
 		_ = os.Remove(tempPath)
-		outcome.Error = err
-		return outcome
+		return err
 	}
 	if err := os.Rename(tempPath, destAbs); err != nil {
 		// Windows cannot rename over an existing file
@@ -391,12 +532,10 @@ func (p InstallPlan) ApplyTask(task InstallTask, targetDir string, dryRun bool) 
 		}
 		if err != nil {
 			_ = os.Remove(tempPath)
-			outcome.Error = err
-			return outcome
+			return err
 		}
 	}
-	outcome.Written = true
-	return outcome
+	return nil
 }
 
 // PreflightResult is the outcome of checking one task without writing anything.
@@ -406,6 +545,9 @@ type PreflightResult struct {
 	Hash  string
 	Bytes int64
 	Error error
+	// FallbackUsed is true when only the pack server copy worked.
+	FallbackUsed   bool
+	FallbackReason error
 }
 
 // VerifyTask downloads a task and checks that its content matches what the pack promises.
@@ -417,35 +559,57 @@ func (p InstallPlan) VerifyTask(task InstallTask) PreflightResult {
 	if strings.TrimSpace(format) == "" {
 		format = "sha256"
 	}
-	source, err := p.OpenTaskSource(task)
-	if err != nil {
-		result.Error = fmt.Errorf("could not download %s: %w", p.DescribeTaskSource(task), err)
+	primaryOpen, primaryDescription, err := p.primarySource(task)
+	if err == nil {
+		err = p.verifyInto(primaryOpen, primaryDescription, format, task.Hash, &result)
+	}
+	if err == nil {
+		result.OK = true
 		return result
+	}
+
+	// If the client would fall back to the pack server, report that as a working-but-degraded
+	// result instead of a hard failure.
+	if p.FallbackToServer {
+		fallbackOpen := func() (io.ReadCloser, error) { return p.Location.Open(task.Dest) }
+		fallbackErr := p.verifyInto(fallbackOpen, p.Location.Resolve(task.Dest), format, task.Hash, &result)
+		if fallbackErr == nil {
+			result.OK = true
+			result.FallbackUsed = true
+			result.FallbackReason = err
+			return result
+		}
+		result.Error = fmt.Errorf("%s (the fallback also failed: %s)", err, fallbackErr)
+		return result
+	}
+	result.Error = err
+	return result
+}
+
+// verifyInto streams a source and compares it against the expected hash.
+func (p InstallPlan) verifyInto(open func() (io.ReadCloser, error), description string, format string, expected string, result *PreflightResult) error {
+	source, err := open()
+	if err != nil {
+		return fmt.Errorf("could not download %s: %w", description, err)
 	}
 	defer source.Close()
 	hasher, err := GetHashImpl(format)
 	if err != nil {
-		result.Error = err
-		return result
+		return err
 	}
 	written, err := io.Copy(hasher, source)
 	result.Bytes = written
 	if err != nil {
-		result.Error = fmt.Errorf("failed while downloading %s: %w", p.DescribeTaskSource(task), err)
-		return result
+		return fmt.Errorf("failed while downloading %s: %w", description, err)
 	}
 	result.Hash = hasher.HashToString(hasher.Sum(nil))
-	if strings.TrimSpace(task.Hash) == "" {
-		result.OK = true
-		return result
+	if strings.TrimSpace(expected) == "" {
+		return nil
 	}
-	if !strings.EqualFold(result.Hash, task.Hash) {
-		result.Error = fmt.Errorf("hash invalid: the served file hashes to %s %s, but the pack expects %s",
-			format, result.Hash, task.Hash)
-		return result
+	if !strings.EqualFold(result.Hash, expected) {
+		return fmt.Errorf("hash invalid: the served file hashes to %s %s, but the pack expects %s", format, result.Hash, expected)
 	}
-	result.OK = true
-	return result
+	return nil
 }
 
 // RunPreflight verifies every task in parallel and returns the results in task order.

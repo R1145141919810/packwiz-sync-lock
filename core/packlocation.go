@@ -3,10 +3,12 @@ package core
 import (
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // PackLocation abstracts where a pack lives: a local directory or an HTTP(S) URL.
@@ -120,6 +122,38 @@ func OpenURL(rawURL string) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("unsupported download URL scheme %q", parsed.Scheme)
 	}
 	resp, err := GetWithUA(rawURL, "application/octet-stream")
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return resp.Body, nil
+}
+
+// OpenURLWithTimeout fetches a file from an absolute http(s) URL with a hard deadline, so a
+// dead or extremely slow mod host fails fast instead of hanging the whole install - which is
+// what lets the client fall back to the pack server.
+func OpenURLWithTimeout(rawURL string, timeout time.Duration) (io.ReadCloser, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid download URL %q: %w", rawURL, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported download URL scheme %q", parsed.Scheme)
+	}
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Accept", "application/octet-stream")
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}

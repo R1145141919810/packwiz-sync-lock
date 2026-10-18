@@ -5,14 +5,16 @@
 > **本项目是 [packwiz](https://github.com/packwiz/packwiz) 的二次开发（非官方项目）**，基于其 MIT 协议源码构建。
 > 感谢 packwiz 作者与所有贡献者；需要原版功能请使用上游项目。
 
-给 packwiz 加了三样东西：**把整合包锁死在某几个文件夹**、**本地模组批量转成 Modrinth 下载**、
+给 packwiz 加了三样东西：**把整合包锁死在某几个文件夹**、**把本地模组批量转成 Modrinth 下载**、
 以及**一个真正会执行锁的客户端安装器**。
 
 | 能力 | 说明 |
 | --- | --- |
 | 🔒 **同步锁** | 在 `pack.toml` 里用 `[sync]` 声明允许同步的文件夹（默认只有 `mods`）。越界文件不会进入 `index.toml`，因此 packwiz-installer **不会下载它们**。 |
 | 🔍 **Modrinth 扫描** | `packwiz modrinth scan` 扫描 mods 文件夹，按哈希反查 Modrinth，自动生成 `.pw.toml` 元数据，客户端直接从 Modrinth CDN 下载。 |
+| 🧩 **CurseForge 补扫** | `packwiz mod scan` 在 Modrinth 之后，自动把没认出来的文件拿去 CurseForge 按指纹反查；命中的写成 `metadata:curseforge` 元数据，客户端自动从 CurseForge 下载。 |
 | 🛡 **客户端执行器** | `packwiz sync` 是原生安装器（不需要 Java），**逐条校验目标路径**，只要有一个越界就整体拒绝、不写任何字节。 |
+| 🌐 **超时回退** | Modrinth / CurseForge 下载超时、被墙或校验失败时，客户端自动改为从整合包服务器上的同一路径下载。 |
 
 ---
 
@@ -109,7 +111,7 @@ go build -o packwiz .          # 需要 Go 1.23+
 
 ```sh
 packwiz lock init mods          # ① 锁死：只同步 mods（可写多个：mods config kubejs）
-packwiz modrinth scan --prune   # ② 扫描 mods 并转成 Modrinth 元数据，删掉本地 jar
+packwiz mod scan --prune        # ② 扫 mods：先 Modrinth，剩下的自动再问 CurseForge
 packwiz refresh                 # ③ 重新计算哈希
 packwiz lock check              # ④ 自检
 ```
@@ -182,10 +184,42 @@ packwiz sync --target ./instance --dry-run          # 先看会装什么
 - 下载按哈希校验，不匹配的文件报错跳过、其余照常安装，最后以非 0 退出；
 - **从不删除文件**（与 packwiz-installer 不同）。
 
-### `packwiz modrinth scan` —— 批量转 Modrinth
+### `packwiz mod scan` —— 一条命令识别两个平台（推荐）
 
 ```sh
-packwiz modrinth scan                 # 扫描锁定的文件夹（无锁时扫 mods/plugins/...）
+packwiz mod scan                 # 扫描锁定的文件夹（无锁时扫 mods/plugins/...）
+packwiz mod scan mods            # 指定文件夹
+packwiz mod scan --dry-run       # 只预览
+packwiz mod scan --prune         # 写出元数据后删掉本地 jar
+packwiz mod scan --strict        # 有文件无法转换时以非 0 退出
+packwiz mod scan --side client   # 强制 side
+packwiz mod scan --algorithm sha1
+```
+
+两轮，按顺序：
+
+1. **Modrinth**：每个文件算 sha1 + sha512，批量 `POST /v2/version_files` 反查；
+2. **CurseForge**：**只对 Modrinth 没认出来的文件**算指纹，批量 `POST /v1/fingerprints` 反查。
+
+命中的文件各自写出标准元数据（`[update.modrinth]` 或 `mode = "metadata:curseforge"`）并登记进索引，
+客户端用原版 packwiz-installer 就能分别从两个平台下载。两个平台都不认识的文件原样保留。
+
+```text
+=== Summary ===
+Scanned on disk: 3
+Downloadable from Modrinth: 2
+Downloadable from CurseForge: 0
+Metadata files written: 2
+No metadata anywhere: 1
+  - mods/my-private-mod.jar
+```
+
+### `packwiz modrinth scan` —— 只转 Modrinth
+
+只查 Modrinth，**不会**去问 CurseForge（要两个一起用 `packwiz mod scan`）：
+
+```sh
+packwiz modrinth scan                 # 扫描锁定的文件夹
 packwiz modrinth scan mods            # 指定文件夹
 packwiz modrinth scan --dry-run       # 只预览
 packwiz modrinth scan --overwrite     # 已有元数据的文件也重建
@@ -195,9 +229,45 @@ packwiz modrinth scan --side client   # 强制 side
 packwiz modrinth scan --algorithm sha1
 ```
 
-对每个文件同时算 sha1 与 sha512，批量调用 `POST /v2/version_files` 反查；
 命中就在同目录写出 `<slug>.pw.toml`（Modrinth CDN 地址 + 哈希 + `[update.modrinth]`）并登记进索引。
 没命中的私有模组原样保留并列出。
+
+### `packwiz curseforge scan` —— 只转 CurseForge
+
+只查 CurseForge，**不会**去问 Modrinth：
+
+```sh
+packwiz curseforge scan                 # 扫描锁定的文件夹
+packwiz curseforge scan mods --dry-run  # 只预览
+packwiz curseforge scan --prune         # 写出元数据后删掉本地 jar
+packwiz curseforge scan --strict        # 有文件无法转换时以非 0 退出
+```
+
+命中后取回项目信息，在同目录写出 `<slug>.pw.toml`：
+
+```toml
+name = "Sodium"
+filename = "sodium-fabric-0.9.3-beta.1+mc26.3.jar"
+side = "both"
+
+[download]
+hash-format = "sha1"
+hash = "1e6aec741b4134258ba1d7d458bae96a2e8e187e"
+mode = "metadata:curseforge"
+
+[update]
+[update.curseforge]
+file-id = 9195226
+project-id = 394468
+```
+
+这是 packwiz / packwiz-installer 的标准格式：客户端读到 `metadata:curseforge` 后
+会自己调用 CurseForge API 取下载地址，**和原版 installer 完全兼容**。
+
+两类文件会被单独列出：
+
+- **Not known to CurseForge**：私有模组、自己改过的 jar，原样保留；
+- **需要手动下载**：作者关闭了第三方下载（`downloadUrl` 为空），installer 会提示玩家手动下载。
 
 ### 原有命令
 
@@ -220,6 +290,36 @@ note = "仅分发 mods"
 `packwiz lock init` 会写入这张表，并打印索引条目变化；如果一次剔除了 90% 以上的条目，
 会提示你是否漏了要同步的文件夹。
 
+### 下载回退（可选）
+
+```toml
+[sync.download]
+fallback-to-server = true   # 默认 true
+timeout = 60                # 单次下载超时（秒），默认 60
+```
+
+开启后，客户端在下面这些情况下会**自动改从整合包服务器下载同一个文件**
+（路径 = 该文件在实例里的落地路径，例如 `mods/sodium.jar`）：
+
+- Modrinth CDN 超时 / 连不上 / 返回 4xx、5xx；
+- CurseForge API 或它的 CDN 超时 / 连不上；
+- 下载到的内容哈希与整合包里记录的**不一致**。
+
+回退下载同样会校验哈希，通过才落盘。命令行可以临时覆盖：
+
+```sh
+packwiz sync --pack-url "URL" --target ./inst --timeout 20   # 20 秒还没下完就回退
+packwiz sync --pack-url "URL" --target ./inst --no-fallback  # 禁用回退，出错即失败
+```
+
+> **服务器上要留着这些文件**，回退才有东西可下。`packwiz modrinth scan --prune` 会删掉本地 jar，
+> 如果你的服务器是客户端唯一的兜底来源，请不要加 `--prune`，或另外上传一份到相同路径。
+>
+> `packwiz serve` 也会把「元数据指向的目标文件」一并对外提供（即使它们不在 `index.toml` 里），
+> 所以用 `packwiz serve` 托管整合包时回退可以直接工作。
+>
+> ⚠️ **回退是 `packwiz sync` 的能力**。原版 packwiz-installer 没有这个机制，它只会报错。
+
 ---
 
 ## 会拦截什么
@@ -238,19 +338,25 @@ note = "仅分发 mods"
 
 ## 与上游的差异
 
-改动集中在 8 个文件，不触碰原有下载/更新逻辑；**没有 `[sync]` 表的整合包行为与原版完全一致**。
+改动集中在 14 个文件，不触碰原有下载/更新逻辑；**没有 `[sync]` 表的整合包行为与原版完全一致**。
 
 | 文件 | 说明 |
 | --- | --- |
-| `core/synclock.go` ★新 | `[sync]` 模型、路径规范化、越界判定 |
+| `core/synclock.go` ★新 | `[sync]` 模型、路径规范化、越界判定、`[sync.download]` 回退策略 |
 | `core/index.go` | `Refresh()` 与 `Write()` 双重强制锁 |
 | `core/pack.go` | `Pack` 增加 `Sync` 字段 |
 | `core/indexfiles.go` | 索引条目访问器 |
-| `core/packlocation.go` ★新 | 本地 / HTTP 来源抽象 |
-| `core/installplan.go` ★新 | 安装计划、校验、预检 |
+| `core/packlocation.go` ★新 | 本地 / HTTP 来源抽象、带超时的下载 |
+| `core/installplan.go` ★新 | 安装计划、CurseForge 解析、哈希校验、CDN→服务器回退、预检 |
+| `core/scanutil.go` ★新 | 扫描器的公共部分：遍历、命名、写元数据 |
+| `cfapi/cfapi.go` ★新 | 极简 CurseForge API 客户端（`sync` 解析 `metadata:curseforge` 用） |
 | `cmd/lock.go` ★新 | `lock init/show/check` |
 | `cmd/sync.go` ★新 | 客户端安装器 |
-| `modrinth/scan.go` ★新 | `modrinth scan` |
+| `cmd/serve.go` | 额外提供「元数据指向的目标文件」，让回退可用 |
+| `modrinth/scan.go` ★新 | `modrinth scan`，并在其后自动补一轮 CurseForge |
+| `curseforge/scan.go` ★新 | `curseforge scan`（指纹反查） |
+| `modscan/modscan.go` ★新 | `packwiz mod scan`：Modrinth → CurseForge 两轮合并，一次写索引 |
+| `curseforge/request.go` | CurseForge 客户端加超时，避免被墙时整个命令卡死 |
 
 ---
 
@@ -271,6 +377,18 @@ note = "仅分发 mods"
 
 **Q: `lock check` 本地通过但客户端仍然乱装？**
 检查的是本机文件，不是对外服务的那一份。用 `--url` 检查，并对比输出里的 `Source:`。
+
+**Q: CurseForge 扫描要自己申请 API key 吗？**
+不用。用的是 packwiz / packwiz-installer 内置的那把 key（与上游保持一致），开箱即可用。
+如果所在网络访问不了 `api.curseforge.com`，扫描会明确报错并跳过，不会影响 Modrinth 的结果。
+
+**Q: 客户端从 Modrinth/CurseForge 下载老是超时怎么办？**
+用 `packwiz sync`（而不是原版 installer），并在 `pack.toml` 里保持 `[sync.download] fallback-to-server = true`。
+CDN 失败时它会自动改从你的服务器下载同一路径的文件，并照常校验哈希。
+记得服务器上要留着这些 jar。
+
+**Q: 两个平台都认不出来的模组怎么办？**
+原样保留在整合包里，继续由你自己的服务器分发——`scan` 只负责「能转的转掉」，不会动它们。
 
 ---
 

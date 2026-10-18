@@ -344,8 +344,17 @@ func printLockCheckOutcome(outcome lockCheckOutcome) {
 
 		if outcome.preflighted > 0 {
 			fmt.Println()
+			fallbackOnly := 0
+			for _, result := range outcome.preflight {
+				if result.FallbackUsed {
+					fallbackOnly++
+				}
+			}
 			if len(failures) == 0 {
 				fmt.Printf("Preflight: all %d file(s) downloaded and matched their recorded hash.\n", outcome.preflighted)
+				if fallbackOnly > 0 {
+					fmt.Printf("  %d of them are only reachable through the pack-server fallback.\n", fallbackOnly)
+				}
 			} else {
 				fmt.Printf("PROBLEM: %d of %d file(s) failed the preflight:\n", len(failures), outcome.preflighted)
 				for i, failure := range failures {

@@ -33,7 +33,9 @@ type cfApiClient struct {
 	httpClient *http.Client
 }
 
-var cfDefaultClient = cfApiClient{&http.Client{}}
+// A timeout keeps a blocked or rate limited CurseForge from hanging every command that
+// touches it (scanning, updating, and the client side fallback decisions).
+var cfDefaultClient = cfApiClient{&http.Client{Timeout: 60 * time.Second}}
 
 func (c *cfApiClient) makeGet(endpoint string) (*http.Response, error) {
 	req, err := http.NewRequest("GET", "https://"+cfApiServer+endpoint, nil)

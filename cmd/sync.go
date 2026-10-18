@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/packwiz/packwiz/core"
 	"github.com/spf13/cobra"
@@ -20,6 +21,8 @@ var syncAllowUnlocked bool
 var syncIgnoreLock bool
 var syncIncludeOptional bool
 var syncWorkers int
+var syncNoFallback bool
+var syncTimeout int
 
 // syncCmd represents the sync command
 var syncCmd = &cobra.Command{
@@ -139,6 +142,12 @@ func runSync() {
 	}
 
 	plan := core.BuildInstallPlan(pack, index, loc, lock, indexRaw)
+	fallbackEnabled := plan.FallbackToServer && !syncNoFallback
+	timeout := plan.DownloadTimeout
+	if syncTimeout > 0 {
+		timeout = time.Duration(syncTimeout) * time.Second
+	}
+	plan.SetDownloadPolicy(fallbackEnabled, timeout)
 
 	if !plan.IndexHashOK() {
 		fmt.Println("The index does not match the hash recorded in pack.toml:")
@@ -229,9 +238,14 @@ func runSync() {
 	close(work)
 	wg.Wait()
 
-	written, upToDate, skipped, failed := 0, 0, 0, 0
+	written, upToDate, skipped, failed, fallback := 0, 0, 0, 0, 0
 	failures := make([]core.InstallOutcome, 0)
+	fallbackOutcomes := make([]core.InstallOutcome, 0)
 	for _, result := range results {
+		if result.FallbackUsed {
+			fallback++
+			fallbackOutcomes = append(fallbackOutcomes, result)
+		}
 		switch {
 		case result.Error != nil:
 			failed++
@@ -264,6 +278,16 @@ func runSync() {
 	if len(plan.Violations) > 0 {
 		fmt.Printf("Refused by the sync lock: %d\n", len(plan.Violations))
 	}
+	if fallback > 0 {
+		fmt.Printf("Downloaded from the pack server because the mod host failed: %d\n", fallback)
+		for i, outcome := range fallbackOutcomes {
+			if i >= 5 {
+				fmt.Printf("  ... and %d more\n", len(fallbackOutcomes)-5)
+				break
+			}
+			fmt.Printf("  - %s (%s)\n", outcome.Task.Dest, firstLine(outcome.FallbackReason))
+		}
+	}
 	if failed > 0 {
 		fmt.Printf("Failed: %d\n", failed)
 		for _, failure := range failures {
@@ -276,6 +300,17 @@ func runSync() {
 		fmt.Println()
 		fmt.Println("Done. Files removed from the pack are left in place; 'packwiz sync' never deletes anything.")
 	}
+}
+
+func firstLine(err error) string {
+	if err == nil {
+		return ""
+	}
+	text := err.Error()
+	if index := strings.IndexByte(text, '\n'); index >= 0 {
+		text = text[:index]
+	}
+	return text
 }
 
 func printCappedList(entries []string, maxPrinted int) {
@@ -299,4 +334,6 @@ func init() {
 	syncCmd.Flags().BoolVar(&syncIgnoreLock, "ignore-lock", false, "DANGEROUS: install files even when the lock refuses them")
 	syncCmd.Flags().BoolVar(&syncIncludeOptional, "include-optional", false, "Also install files the pack marks as optional")
 	syncCmd.Flags().IntVar(&syncWorkers, "workers", 8, "How many files to download at the same time")
+	syncCmd.Flags().BoolVar(&syncNoFallback, "no-fallback", false, "Never fall back to the pack server, even when the mod host fails")
+	syncCmd.Flags().IntVar(&syncTimeout, "timeout", 0, "Seconds before a single download is considered failed and the fallback is tried (0 = use the pack setting)")
 }

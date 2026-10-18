@@ -21,6 +21,29 @@ import (
 
 var refreshMutex sync.RWMutex
 
+// serveDestinationPaths holds every path that an indexed metadata file installs to. Serving
+// those as well lets "packwiz sync" fall back to the pack server when Modrinth or CurseForge
+// is down, even when the local copies were pruned away.
+var serveDestinationPaths = make(map[string]bool)
+
+// rebuildServeDestinations recomputes serveDestinationPaths from the current index.
+func rebuildServeDestinations(index core.Index) {
+	paths := make(map[string]bool)
+	for relPath, holder := range index.Files {
+		if !holder.IsMetaFile() {
+			continue
+		}
+		filename, err := core.MetaFilename(index.ResolveIndexPath(string(relPath)))
+		if err != nil || filename == "" {
+			continue
+		}
+		if dest, destErr := (core.SyncLock{}).CheckMetaDest(string(relPath), filename); destErr == nil && dest != "" {
+			paths[dest] = true
+		}
+	}
+	serveDestinationPaths = paths
+}
+
 //go:embed serve-templates/index.html
 var indexPage string
 
@@ -48,6 +71,7 @@ var serveCmd = &cobra.Command{
 				fmt.Println(err)
 				os.Exit(1)
 			}
+			rebuildServeDestinations(index)
 			packServeDir := filepath.Dir(viper.GetString("pack-file"))
 			packFileName := filepath.Base(viper.GetString("pack-file"))
 
@@ -108,8 +132,9 @@ var serveCmd = &cobra.Command{
 					refreshMutex.RLock()
 				} else {
 					refreshMutex.RLock()
-					// Only allow indexed files
-					if _, found := index.Files[indexRelPath]; !found {
+					// Only allow indexed files, plus the files those entries install to, so a
+					// client can fall back to the pack server when a mod host fails.
+					if _, found := index.Files[indexRelPath]; !found && !serveDestinationPaths[indexRelPath] {
 						fmt.Printf("File not found: %s\n", destPath)
 						refreshMutex.RUnlock()
 						w.WriteHeader(404)
@@ -175,6 +200,7 @@ func doServeRefresh(pack *core.Pack, index *core.Index) error {
 	if err != nil {
 		return err
 	}
+	rebuildServeDestinations(*index)
 	fmt.Println("Index refreshed!")
 
 	return nil
