@@ -17,11 +17,6 @@ import (
 	"github.com/spf13/viper"
 )
 
-var modCmd = &cobra.Command{
-	Use:   "mod",
-	Short: "Identify mods on Modrinth and CurseForge",
-}
-
 var (
 	modScanDryRun    bool
 	modScanOverwrite bool
@@ -244,8 +239,7 @@ func printCombinedResult(targets []core.ScanTarget, modrinthResult modrinth.Scan
 }
 
 func init() {
-	modCmd.AddCommand(modScanCmd)
-	cmd.Add(modCmd)
+	cmd.ModCmd.AddCommand(modScanCmd)
 
 	modScanCmd.Flags().BoolVar(&modScanDryRun, "dry-run", false, "Report what would be written without writing anything")
 	modScanCmd.Flags().BoolVar(&modScanOverwrite, "overwrite", false, "Also create metadata for files that already have metadata")

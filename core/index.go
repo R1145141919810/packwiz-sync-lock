@@ -175,6 +175,9 @@ var ignoreDefaults = []string{
 	// Exclude packwiz binaries, if the user puts them in their pack folder
 	"packwiz.exe",
 	"packwiz", // Note: also excludes packwiz/ as a directory - you can negate this pattern if you want a directory called packwiz
+
+	// Exclude the backups that "packwiz mod update" keeps of the files it replaces
+	".packwiz-backup/**",
 }
 
 func readGitignore(path string) (*gitignore.GitIgnore, bool) {
@@ -566,6 +569,11 @@ func (in *Index) RefreshFileWithHash(path, format, hash string, markAsMetaFile b
 		hash = ""
 	}
 	return in.updateFileHashGiven(path, format, hash, markAsMetaFile)
+}
+
+// UpdateFileEntry records a file that is on disk in the index, hashing it first.
+func (in *Index) UpdateFileEntry(path string) error {
+	return in.updateFile(path)
 }
 
 // FindMod finds a mod in the index and returns its path and whether it has been found

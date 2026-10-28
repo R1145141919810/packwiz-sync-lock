@@ -15,6 +15,7 @@
 | 🧩 **CurseForge 补扫** | `packwiz mod scan` 在 Modrinth 之后，自动把没认出来的文件拿去 CurseForge 按指纹反查；命中的写成 `metadata:curseforge` 元数据，客户端自动从 CurseForge 下载。 |
 | 🛡 **客户端执行器** | `packwiz sync` 是原生安装器（不需要 Java），**逐条校验目标路径**，只要有一个越界就整体拒绝、不写任何字节。 |
 | 🌐 **超时回退** | Modrinth / CurseForge 下载超时、被墙或校验失败时，客户端自动改为从整合包服务器上的同一路径下载。 |
+| ⬆️ **模组更新** | `packwiz mod update` 把模组升级到 Modrinth/CurseForge 上的新版本，**并直接替换服务端的 jar**，元数据与索引同步改写。 |
 
 ---
 
@@ -214,6 +215,54 @@ No metadata anywhere: 1
   - mods/my-private-mod.jar
 ```
 
+### `packwiz mod update` —— 更新模组并替换服务端文件
+
+```sh
+packwiz mod update sodium --dry-run   # 只看计划，不下载不写盘
+packwiz mod update sodium             # 交互确认后执行
+packwiz mod update sodium lithium -y  # 多个模组，跳过确认
+packwiz mod update --all --dry-run    # 全部可更新模组
+packwiz mod update --all --yes        # 全部，直接执行
+packwiz mod update sodium --metadata-only  # 只改元数据，不动文件
+```
+
+与上游 `packwiz update` 的区别：上游只重写 `.pw.toml`，**不会下载文件**；本命令会把新版本
+真正下载下来、替换 `mods/` 里的 jar，并同步改写索引和 `pack.toml`，服务端重启后即生效。
+
+```text
+Checking 1 mod(s) for updates...
+
+Update plan:
+  Sodium                           sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
+
+Up to date: 0, pinned: 0, skipped: 0
+Apply these updates? [y/N]: y
+
+  Sodium: sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
+
+Updated 1 mod(s), 0 failed.
+Replaced files were moved to .packwiz-backup/20261029-030829
+Restart the server (or Minecraft) so it loads the new jars.
+```
+
+安全措施：
+
+| 措施 | 说明 |
+| --- | --- |
+| 先下载后落盘 | 新文件先下到临时文件，**哈希校验通过**才替换 |
+| 自动备份 | 旧 jar 移动到 `.packwiz-backup/<时间戳>/`，不删除 |
+| 失败回滚 | 任何一步出错 → 恢复旧文件 + 旧元数据，退出码非 0 |
+| 只写锁内路径 | 落地路径必须通过 `[sync]` 锁校验 |
+| 默认确认 | 不加 `--yes` 会先列出计划再问；`--dry-run` 完全不写 |
+| 只用显式目标 | 必须给名字或显式 `--all`，不会静默全量更新 |
+
+不会做的事：**不改 Minecraft 版本 / 加载器**（只做现有模组升级）、**不自动加依赖**（与上游一致，
+缺依赖请手动 `packwiz modrinth add`）、**不删任何不在更新列表里的文件**。
+被 `pin` 的模组会被跳过。
+
+> 服务端建议：第一次跑之前先停服或做一次快照；`.packwiz-backup/` 已加入默认忽略规则，
+> 不会被写进索引。
+
 ### `packwiz modrinth scan` —— 只转 Modrinth
 
 只查 Modrinth，**不会**去问 CurseForge（要两个一起用 `packwiz mod scan`）：
@@ -338,7 +387,7 @@ packwiz sync --pack-url "URL" --target ./inst --no-fallback  # 禁用回退，�
 
 ## 与上游的差异
 
-改动集中在 14 个文件，不触碰原有下载/更新逻辑；**没有 `[sync]` 表的整合包行为与原版完全一致**。
+改动集中在 16 个文件，不触碰原有下载/更新逻辑；**没有 `[sync]` 表的整合包行为与原版完全一致**。
 
 | 文件 | 说明 |
 | --- | --- |
@@ -356,6 +405,8 @@ packwiz sync --pack-url "URL" --target ./inst --no-fallback  # 禁用回退，�
 | `modrinth/scan.go` ★新 | `modrinth scan`，并在其后自动补一轮 CurseForge |
 | `curseforge/scan.go` ★新 | `curseforge scan`（指纹反查） |
 | `modscan/modscan.go` ★新 | `packwiz mod scan`：Modrinth → CurseForge 两轮合并，一次写索引 |
+| `modupdate/modupdate.go` ★新 | `packwiz mod update`：下载新版本、替换文件、备份与回滚 |
+| `cmd/mod.go` ★新 | `packwiz mod` 父命令 |
 | `curseforge/request.go` | CurseForge 客户端加超时，避免被墙时整个命令卡死 |
 
 ---

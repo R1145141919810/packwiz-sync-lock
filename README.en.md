@@ -16,6 +16,7 @@ Five additions to packwiz: **lock a pack to specific folders**, **turn local mod
 | 🧩 **CurseForge pass** | `packwiz mod scan` fingerprints whatever Modrinth did not know against CurseForge; matches become `metadata:curseforge` metadata, so clients download them from CurseForge automatically. |
 | 🛡 **Client enforcer** | `packwiz sync` is a native installer (no Java) that validates **every destination path** and refuses the whole run if a single one is out of scope. |
 | 🌐 **Timeout fallback** | When a Modrinth/CurseForge download times out, is blocked or fails its hash check, the client downloads the file from your own server instead. |
+| ⬆️ **Mod updates** | `packwiz mod update` upgrades mods to their newest Modrinth/CurseForge version and **replaces the jar on your server**, rewriting the metadata and index with it. |
 
 ---
 
@@ -163,6 +164,55 @@ No metadata anywhere: 1
   - mods/my-private-mod.jar
 ```
 
+### `packwiz mod update` — update mods and replace the files
+
+```sh
+packwiz mod update sodium --dry-run   # show the plan, download and write nothing
+packwiz mod update sodium             # ask for confirmation, then apply
+packwiz mod update sodium lithium -y  # several mods, no prompt
+packwiz mod update --all --dry-run    # everything that has an update
+packwiz mod update --all --yes        # everything, apply directly
+packwiz mod update sodium --metadata-only  # metadata only, no files
+```
+
+Unlike upstream `packwiz update` (which only rewrites `.pw.toml`), this downloads the new
+version, **replaces the jar in `mods/`** and rewrites the index and `pack.toml`, so a server
+picks the new version up on its next restart.
+
+```text
+Checking 1 mod(s) for updates...
+
+Update plan:
+  Sodium                           sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
+
+Up to date: 0, pinned: 0, skipped: 0
+Apply these updates? [y/N]: y
+
+  Sodium: sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
+
+Updated 1 mod(s), 0 failed.
+Replaced files were moved to .packwiz-backup/20261029-030829
+Restart the server (or Minecraft) so it loads the new jars.
+```
+
+Safety:
+
+| Measure | What it does |
+| --- | --- |
+| Download first | The new file goes to a temporary file and must pass its **hash check** before anything is replaced |
+| Automatic backup | The replaced file is moved to `.packwiz-backup/<timestamp>/`, never deleted |
+| Rollback | If any step fails, the old file **and** the old metadata are restored and the command exits non-zero |
+| Lock aware | Every destination must pass the `[sync]` lock |
+| Confirmation | Without `--yes` you see the plan and are asked first; `--dry-run` writes nothing |
+| Explicit targets | You must name mods or pass `--all`; nothing is updated silently |
+
+What it deliberately does **not** do: change the Minecraft version or loader, add dependencies
+automatically (same as upstream — add them with `packwiz modrinth add`), or delete files that
+are not part of the update. Pinned mods are skipped.
+
+> For servers: stop the server or take a snapshot before the first run. `.packwiz-backup/` is
+> in the default ignore list, so backups are never written into the index.
+
 ### `packwiz modrinth scan` — Modrinth only
 
 This one never talks to CurseForge; use `packwiz mod scan` for both.
@@ -268,7 +318,7 @@ packwiz sync --pack-url "URL" --target ./inst --no-fallback  # never fall back
 
 ## Differences from upstream
 
-Fourteen files change; the download/update logic is untouched, and **packs without a `[sync]` table behave
+Sixteen files change; the download/update logic is untouched, and **packs without a `[sync]` table behave
 exactly like upstream**.
 
 | File | Change |
@@ -287,6 +337,8 @@ exactly like upstream**.
 | `modrinth/scan.go` ★new | `modrinth scan`, chaining the CurseForge pass |
 | `curseforge/scan.go` ★new | `curseforge scan` (fingerprint lookup) |
 | `modscan/modscan.go` ★new | `packwiz mod scan`: Modrinth then CurseForge, one index write |
+| `modupdate/modupdate.go` ★new | `packwiz mod update`: download, replace, back up and roll back |
+| `cmd/mod.go` ★new | the `packwiz mod` parent command |
 | `curseforge/request.go` | timeout for the CurseForge client so a blocked host cannot hang commands |
 
 ---
