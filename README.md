@@ -327,6 +327,9 @@ updated = "2026-10-29T06:47:54Z"
 
 > 服务端建议：第一次跑之前先停服或做一次快照；`.packwiz-backup/` 与 `.packwiz-*.tmp`
 > 已加入默认忽略规则，不会被写进索引。
+>
+> 如果整合包放在 git 仓库里，建议把这两项也加进 `.gitignore`：`.packwiz-backup/` 和
+> `.packwiz-*.tmp`；而 `packwiz-mod-lock.toml` **应该提交**，它是版本记录的一部分。
 
 ### `packwiz modrinth scan` —— 只转 Modrinth
 

@@ -279,6 +279,9 @@ are not part of the update. Pinned mods are skipped.
 > For servers: stop the server or take a snapshot before the first run. `.packwiz-backup/` and
 > `.packwiz-*.tmp` are in the default ignore list, so neither backups nor interrupt leftovers
 > are ever written into the index.
+>
+> If the pack lives in git, add `.packwiz-backup/` and `.packwiz-*.tmp` to its `.gitignore`.
+> `packwiz-mod-lock.toml` should be **committed** — it is part of the version record.
 
 ### `packwiz modrinth scan` — Modrinth only
 
