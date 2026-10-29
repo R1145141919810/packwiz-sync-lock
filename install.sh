@@ -19,7 +19,7 @@
 # =============================================================================
 set -eu
 
-INSTALLER_VERSION="1.0.0"
+INSTALLER_VERSION="1.2.0"
 PROGRAM="packwiz"
 PREFIX=""
 BIN_DIR=""
@@ -100,7 +100,12 @@ if [ "$os" = "windows" ]; then
 fi
 
 # ------------------------------------------------------------- source file ---
-script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# When the script arrives through a pipe (curl ... | sh) there is no file to take
+# binaries from, so the directory is left empty and the release download is used.
+script_dir=""
+if [ -f "$0" ]; then
+	script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+fi
 
 sha256_of() {
 	if have sha256sum; then
@@ -132,6 +137,9 @@ find_local_binary() {
 			printf '%s\n' "$BIN_DIR/$bin_name"
 			return 0
 		fi
+		return 1
+	fi
+	if [ -z "$script_dir" ]; then
 		return 1
 	fi
 	for candidate in "$script_dir/$bin_name" "$script_dir/dist/$bin_name" "$script_dir/../dist/$bin_name"; do

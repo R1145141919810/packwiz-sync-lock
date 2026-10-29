@@ -437,10 +437,29 @@ what it can prove.
 
 ---
 
+## Acknowledgements
+
+Much of what this tool does came out of discussions in QQ group **608043198**.
+Thanks in particular to:
+
+| Thanks | The idea |
+| --- | --- |
+| **@小爱bot** | Two verification layers: compare the download against the sha256/sha512 in the host's metadata and refuse outright on a mismatch; and pick versions by release type only — filter pre-releases and betas out first, then cross-check publish date against version number. Also proposed snapshotting the pack config and `mods/` before updating, skipping `.dis`-style disabled files instead of renaming them, and stopping with an error on a failed check rather than quietly falling back. The opt-in `--prefer-version-number` switch was her suggestion as well. |
+| **@鱼** | Added "record the chosen version and the reason in the lock", plus "compare against it before every update", so version drift has nowhere to hide. Also insisted that silent rollbacks are the worst option, because afterwards nobody can tell where the problem started. |
+| **@小爱** | Joined the discussion and suggested improvements. |
+| **@大肥鱼** | Joined the discussion and suggested improvements. |
+
+Without those suggestions `packwiz mod update` would have stayed a "good enough" bulk updater.
+
+Thanks as well to the [packwiz](https://github.com/packwiz/packwiz) authors and contributors for
+the foundation this is built on.
+
+---
+
 ## License
 
 **MIT**, see [LICENSE](LICENSE).
 
 - Upstream: [packwiz/packwiz](https://github.com/packwiz/packwiz) (MIT)
-- Upstream copyright notices are preserved
+- Upstream copyright notices are preserved (see [NOTICE](NOTICE))
 - Modifications maintained by **R1145141919810**
