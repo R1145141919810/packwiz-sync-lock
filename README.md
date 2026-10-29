@@ -218,50 +218,111 @@ No metadata anywhere: 1
 ### `packwiz mod update` —— 更新模组并替换服务端文件
 
 ```sh
-packwiz mod update sodium --dry-run   # 只看计划，不下载不写盘
-packwiz mod update sodium             # 交互确认后执行
-packwiz mod update sodium lithium -y  # 多个模组，跳过确认
-packwiz mod update --all --dry-run    # 全部可更新模组
-packwiz mod update --all --yes        # 全部，直接执行
-packwiz mod update sodium --metadata-only  # 只改元数据，不动文件
+packwiz mod update sodium --dry-run                # 只看计划，不下载不写盘
+packwiz mod update sodium                          # 交互确认后执行
+packwiz mod update sodium lithium -y               # 多个模组，跳过确认
+packwiz mod update --all --dry-run                 # 全部可更新模组
+packwiz mod update --all --yes                     # 全部，直接执行
+packwiz mod update --all --prefer-version-number   # 按版本号优先选版（默认关闭）
+packwiz mod update --all --include-disabled        # 连 .jar.dis 的也更新
+packwiz mod update sodium --metadata-only          # 只改元数据，不动文件
 ```
 
 与上游 `packwiz update` 的区别：上游只重写 `.pw.toml`，**不会下载文件**；本命令会把新版本
 真正下载下来、替换 `mods/` 里的 jar，并同步改写索引和 `pack.toml`，服务端重启后即生效。
 
+#### 选版规则（默认只认正式版）
+
+1. 只考虑作者标记为 **release** 的版本；beta / alpha / 预发布一律跳过。若该项目在你这个
+   整合包下压根没有 release，才会回退并打印 `Note: ... falling back to pre-release versions`。
+2. 在 release 里取**发布时间最新**的那一版——Modrinth 的版本号是自由文本
+   （`forge-15.4.12`、`v2.0.0-prerelease.3`），不可靠，所以默认不看它。
+3. **不会降级**：如果选中的版本号低于当前安装的版本（作者给旧分支补发构建的常见情况），
+   该模组会列进 `Held back` 并跳过，而不是默默退化。
+4. 想按版本号优先：`--prefer-version-number`（**默认关闭**，需要时才开）。
+
 ```text
-Checking 1 mod(s) for updates...
+Update plan (full releases only):
+  Just Enough Items     jei-1.20.1-forge-15.49.0.200.jar -> jei-1.20.1-forge-15.56.0.205.jar
 
-Update plan:
-  Sodium                           sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
+Held back: 1
+  - Joban Client Mod: would downgrade 2.2.4 -> 2.0.0-prerelease.3
 
-Up to date: 0, pinned: 0, skipped: 0
-Apply these updates? [y/N]: y
-
-  Sodium: sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
-
-Updated 1 mod(s), 0 failed.
-Replaced files were moved to .packwiz-backup/20261029-030829
-Restart the server (or Minecraft) so it loads the new jars.
+Skipped because the file is disabled: 1 (use --include-disabled to update them)
+Up to date: 44, pinned: 0, skipped: 0
 ```
 
-安全措施：
+#### 两层验证
+
+| 层 | 做什么 |
+| --- | --- |
+| 下载后哈希校验 | 按平台公布的哈希比对（sha512 → sha256 → sha1，取元数据里最强的那一种），**对不上直接拒绝**，防下载损坏与文件被替换 |
+| 版本双重核对 | 在"只认 release + 发布时间"之上再用版本号做一次**降级判断**，把"发布晚但版本更低"的候选挡掉 |
+
+**校验失败会立刻停下来**：不是悄悄回退到旧版本继续跑，而是回滚该模组、把已完成的部分写盘、
+以非 0 退出——出问题第一时间就能看见，不用事后猜。
+
+#### 锁文件 `packwiz-mod-lock.toml`
+
+每次成功更新都会记录：来源、版本号、版本 ID、发布类型、文件名、哈希、选版依据、时间。
+
+```toml
+[mods."jei"]
+source = "modrinth"
+version-id = "9jqubC9n"
+version = "15.56.0.205"
+release-type = "release"
+filename = "jei-1.20.1-forge-15.56.0.205.jar"
+hash-format = "sha512"
+hash = "1306fe15c81d54aa9ff8f3d9f04812c0d61ffaaae433c29621f926db8f8e2c898669ccdd99e025849859d38b7a2eac170c466390b467f4dfa77542b5dbdd1678"
+selected-by = "newest full release"
+updated = "2026-10-29T06:47:54Z"
+```
+
+**下次运行前会先拿磁盘上的文件跟它比一遍**：哈希对不上就说明这个 jar 被外部动过，该模组会被
+跳过并提示 `changed since ...`；确实要覆盖时加 `--force`。这样"哪天被谁偷偷换了"能立刻发现。
+
+#### 禁用文件不会被自动改名
+
+`filename` 以 `.jar.dis` / `.disabled` 结尾的模组直接跳过并计数
+（`Skipped because the file is disabled`），不会像以前那样更新后变成启用的 `.jar`。
+
+#### 回滚与备份
+
+替换前把 `pack.toml`、`index.toml` 和将被替换的 jar 一起放进 `.packwiz-backup/<时间戳>/`；
+任何失败都会把旧文件和旧元数据原样放回。
 
 | 措施 | 说明 |
 | --- | --- |
 | 先下载后落盘 | 新文件先下到临时文件，**哈希校验通过**才替换 |
-| 自动备份 | 旧 jar 移动到 `.packwiz-backup/<时间戳>/`，不删除 |
+| 自动备份 | `pack.toml`、`index.toml` 与旧 jar 一并保存到 `.packwiz-backup/<时间戳>/` |
 | 失败回滚 | 任何一步出错 → 恢复旧文件 + 旧元数据，退出码非 0 |
+| 校验失败即停 | 不降级、不静默、不复用旧文件 |
 | 只写锁内路径 | 落地路径必须通过 `[sync]` 锁校验 |
 | 默认确认 | 不加 `--yes` 会先列出计划再问；`--dry-run` 完全不写 |
 | 只用显式目标 | 必须给名字或显式 `--all`，不会静默全量更新 |
 
-不会做的事：**不改 Minecraft 版本 / 加载器**（只做现有模组升级）、**不自动加依赖**（与上游一致，
-缺依赖请手动 `packwiz modrinth add`）、**不删任何不在更新列表里的文件**。
-被 `pin` 的模组会被跳过。
+#### 参数
 
-> 服务端建议：第一次跑之前先停服或做一次快照；`.packwiz-backup/` 已加入默认忽略规则，
-> 不会被写进索引。
+| 参数 | 说明 |
+| --- | --- |
+| `-a, --all` | 更新所有有可用来源的模组 |
+| `-n, --dry-run` | 只列计划 |
+| `-y, --yes` | 跳过确认 |
+| `--metadata-only` | 只改元数据，不下载 |
+| `--prefer-version-number` | 按版本号优先选版（默认关闭） |
+| `--include-disabled` | 连 `.dis` / `.disabled` 的模组也更新 |
+| `--force` | 即使锁检查发现文件被改过也继续 |
+| `--no-lock` / `--no-lock-check` | 不写 / 不比对 `packwiz-mod-lock.toml` |
+| `--backup-dir DIR` | 备份目录（默认 `.packwiz-backup`） |
+| `--no-backup` | 不备份，直接删除旧文件 |
+| `--timeout N` | 单次下载超时秒数（默认 60） |
+
+不会做的事：**不改 Minecraft 版本 / 加载器**（只做现有模组升级）、**不自动加依赖**（与上游一致，
+缺依赖请手动 `packwiz modrinth add`）、**不删任何不在更新列表里的文件**。被 `pin` 的模组会被跳过。
+
+> 服务端建议：第一次跑之前先停服或做一次快照；`.packwiz-backup/` 与 `.packwiz-*.tmp`
+> 已加入默认忽略规则，不会被写进索引。
 
 ### `packwiz modrinth scan` —— 只转 Modrinth
 

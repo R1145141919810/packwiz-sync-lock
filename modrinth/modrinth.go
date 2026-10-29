@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strings"
 
 	modrinthApi "codeberg.org/theepicblock/go-modrinth/modrinth"
 	"github.com/packwiz/packwiz/cmd"
@@ -307,6 +308,17 @@ func findLatestVersion(versions []*modrinthApi.Version, gameVersions []string, u
 	return latestValidVersion
 }
 
+// filterReleaseVersions keeps only versions the author marked as a full release.
+func filterReleaseVersions(versions []*modrinthApi.Version) []*modrinthApi.Version {
+	releases := make([]*modrinthApi.Version, 0, len(versions))
+	for _, version := range versions {
+		if version.VersionType != nil && strings.EqualFold(*version.VersionType, "release") {
+			releases = append(releases, version)
+		}
+	}
+	return releases
+}
+
 func getLatestVersion(projectID string, name string, pack core.Pack) (*modrinthApi.Version, error) {
 	gameVersions, err := pack.GetSupportedMCVersions()
 	if err != nil {
@@ -331,14 +343,25 @@ func getLatestVersion(projectID string, name string, pack core.Pack) (*modrinthA
 		return nil, errors.New("no valid versions found\n\tUse the 'packwiz settings acceptable-versions' command to accept more game versions\n\tTo use datapacks, add a datapack loader mod and specify the datapack-folder option with the folder this mod loads datapacks from")
 	}
 
-	// TODO: option to always compare using flexver?
-	// TODO: ask user which one to use?
-	flexverLatest := findLatestVersion(result, gameVersions, true)
-	releaseDateLatest := findLatestVersion(result, gameVersions, false)
+	// Only versions the author marked as a full release may be picked automatically;
+	// pre-releases, betas and alphas are what "update" used to silently fall into.
+	candidates := filterReleaseVersions(result)
+	if len(candidates) == 0 {
+		fmt.Printf("Note: %s has no full release for this pack; falling back to pre-release versions\n", name)
+		candidates = result
+	}
+
+	flexverLatest := findLatestVersion(candidates, gameVersions, true)
+	releaseDateLatest := findLatestVersion(candidates, gameVersions, false)
 	if flexverLatest != releaseDateLatest && releaseDateLatest.VersionNumber != nil && flexverLatest.VersionNumber != nil {
 		fmt.Printf("Warning: Modrinth versions for %s inconsistent between latest version number and newest release date (%s vs %s)\n", name, *flexverLatest.VersionNumber, *releaseDateLatest.VersionNumber)
 	}
 
+	// Version numbers on Modrinth are free-form, so "newest published" is the default. Packs
+	// that would rather trust the version number can opt in with --prefer-version-number.
+	if viper.GetBool("mod-update.prefer-version-number") {
+		return flexverLatest, nil
+	}
 	return releaseDateLatest, nil
 }
 

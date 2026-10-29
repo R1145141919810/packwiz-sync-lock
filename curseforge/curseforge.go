@@ -286,13 +286,43 @@ func filterFileInfoLoaderIndex(packLoaders []string, fileInfoData modFileInfo) (
 }
 
 // findLatestFile looks at mod info, and finds the latest file ID (and potentially the file info for it - may be null)
+// releaseTypeName turns the CurseForge file classification into a readable name.
+func releaseTypeName(fileType fileType) string {
+	switch fileType {
+	case fileTypeRelease:
+		return "release"
+	case fileTypeBeta:
+		return "beta"
+	case fileTypeAlpha:
+		return "alpha"
+	default:
+		return ""
+	}
+}
+
+// findLatestFile picks the newest file for the pack, preferring full releases.
+//
+// packwiz used to ignore the release channel entirely, which is how an update could land on a
+// beta that happened to be published later. Now only release files are considered, and the
+// whole list is used only when a project has no release build for this pack at all.
 func findLatestFile(modInfoData modInfo, mcVersions []string, packLoaders []string) (fileID uint32, fileInfoData *modFileInfo, fileName string) {
+	fileID, fileInfoData, fileName = findLatestFileFiltered(modInfoData, mcVersions, packLoaders, true)
+	if fileID == 0 {
+		fileID, fileInfoData, fileName = findLatestFileFiltered(modInfoData, mcVersions, packLoaders, false)
+	}
+	return fileID, fileInfoData, fileName
+}
+
+func findLatestFileFiltered(modInfoData modInfo, mcVersions []string, packLoaders []string, releaseOnly bool) (fileID uint32, fileInfoData *modFileInfo, fileName string) {
 	cfMcVersions := getCurseforgeVersions(mcVersions)
 	bestMcVer := -1
 	bestLoaderType := modloaderTypeAny
 
 	// For snapshots, curseforge doesn't put them in GameVersionLatestFiles
 	for _, v := range modInfoData.LatestFiles {
+		if releaseOnly && v.FileType != 0 && v.FileType != fileTypeRelease {
+			continue
+		}
 		mcVerIdx := core.HighestSliceIndex(mcVersions, v.GameVersions)
 		loaderIdx, loaderValid := filterFileInfoLoaderIndex(packLoaders, v)
 
@@ -323,8 +353,10 @@ func findLatestFile(modInfoData modInfo, mcVersions []string, packLoaders []stri
 			bestLoaderType = loaderIdx
 		}
 	}
-	// TODO: manage alpha/beta/release correctly, check update channel?
 	for _, v := range modInfoData.GameVersionLatestFiles {
+		if releaseOnly && v.FileType != 0 && v.FileType != fileTypeRelease {
+			continue
+		}
 		mcVerIdx := slices.Index(cfMcVersions, v.GameVersion)
 		loaderIdx, loaderValid := filterLoaderTypeIndex(packLoaders, v.Modloader)
 
@@ -428,9 +460,15 @@ func (u cfUpdater) CheckUpdate(mods []*core.Mod, pack core.Pack) ([]core.UpdateC
 		fileID, fileInfoData, fileName := findLatestFile(modInfos[i], mcVersions, packLoaders)
 		if fileID != project.FileID && fileID != 0 {
 			// Update (or downgrade, if changing to an older version) available!
+			versionType := ""
+			if fileInfoData != nil {
+				versionType = releaseTypeName(fileInfoData.FileType)
+			}
 			results[i] = core.UpdateCheck{
 				UpdateAvailable: true,
 				UpdateString:    v.FileName + " -> " + fileName,
+				NewVersion:      fileName,
+				NewVersionType:  versionType,
 				CachedState:     cachedStateStore{modInfos[i], fileID, fileInfoData},
 			}
 		} else {

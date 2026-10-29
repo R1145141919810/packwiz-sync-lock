@@ -176,8 +176,10 @@ var ignoreDefaults = []string{
 	"packwiz.exe",
 	"packwiz", // Note: also excludes packwiz/ as a directory - you can negate this pattern if you want a directory called packwiz
 
-	// Exclude the backups that "packwiz mod update" keeps of the files it replaces
+	// Exclude the backups that "packwiz mod update" keeps of the files it replaces, and the
+	// temporary files it uses while downloading, so an interrupted run never leaks into a pack
 	".packwiz-backup/**",
+	".packwiz-*.tmp",
 }
 
 func readGitignore(path string) (*gitignore.GitIgnore, bool) {

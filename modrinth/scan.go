@@ -590,6 +590,8 @@ func printModrinthScanResult(result ScanResult, dryRun bool, strict bool) {
 	fmt.Printf("Metadata files written: %d\n", result.Written)
 	if result.Pruned > 0 {
 		fmt.Printf("Local files pruned: %d\n", result.Pruned)
+		fmt.Println("Note: pruned files are no longer on this server, so the pack-server fallback has")
+		fmt.Println("      nothing to serve for them; keep a copy if you rely on that.")
 	}
 	if result.AlreadyPresent > 0 {
 		fmt.Printf("Already had metadata: %d\n", result.AlreadyPresent)

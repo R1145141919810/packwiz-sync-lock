@@ -167,51 +167,118 @@ No metadata anywhere: 1
 ### `packwiz mod update` — update mods and replace the files
 
 ```sh
-packwiz mod update sodium --dry-run   # show the plan, download and write nothing
-packwiz mod update sodium             # ask for confirmation, then apply
-packwiz mod update sodium lithium -y  # several mods, no prompt
-packwiz mod update --all --dry-run    # everything that has an update
-packwiz mod update --all --yes        # everything, apply directly
-packwiz mod update sodium --metadata-only  # metadata only, no files
+packwiz mod update sodium --dry-run                # show the plan, download and write nothing
+packwiz mod update sodium                          # ask for confirmation, then apply
+packwiz mod update sodium lithium -y               # several mods, no prompt
+packwiz mod update --all --dry-run                 # everything that has an update
+packwiz mod update --all --yes                     # everything, apply directly
+packwiz mod update --all --prefer-version-number   # rank by version number instead (off by default)
+packwiz mod update --all --include-disabled        # also update .jar.dis mods
+packwiz mod update sodium --metadata-only          # metadata only, no files
 ```
 
 Unlike upstream `packwiz update` (which only rewrites `.pw.toml`), this downloads the new
 version, **replaces the jar in `mods/`** and rewrites the index and `pack.toml`, so a server
 picks the new version up on its next restart.
 
+#### Which version gets picked (full releases only)
+
+1. Only versions the author marked as **release** are considered; betas, alphas and
+   pre-releases are skipped. If a project has no release for this pack at all, the command
+   falls back with a `Note: ... falling back to pre-release versions`.
+2. Among releases the **newest published** one wins — version numbers on Modrinth are free-form
+   (`forge-15.4.12`, `v2.0.0-prerelease.3`) and cannot be trusted, so they are not used by default.
+3. **No downgrades**: if the candidate's version number is lower than what is installed (a
+   backport published later, for example), the mod is listed under `Held back` and skipped.
+4. Prefer version numbers anyway: `--prefer-version-number` (**off by default**).
+
 ```text
-Checking 1 mod(s) for updates...
+Update plan (full releases only):
+  Just Enough Items     jei-1.20.1-forge-15.49.0.200.jar -> jei-1.20.1-forge-15.56.0.205.jar
 
-Update plan:
-  Sodium                           sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
+Held back: 1
+  - Joban Client Mod: would downgrade 2.2.4 -> 2.0.0-prerelease.3
 
-Up to date: 0, pinned: 0, skipped: 0
-Apply these updates? [y/N]: y
-
-  Sodium: sodium-fabric-0.9.2+mc26.3.jar -> sodium-fabric-0.9.3-beta.1+mc26.3.jar
-
-Updated 1 mod(s), 0 failed.
-Replaced files were moved to .packwiz-backup/20261029-030829
-Restart the server (or Minecraft) so it loads the new jars.
+Skipped because the file is disabled: 1 (use --include-disabled to update them)
+Up to date: 44, pinned: 0, skipped: 0
 ```
 
-Safety:
+#### Two verification layers
+
+| Layer | What it does |
+| --- | --- |
+| Hash check after download | Compares against the hash the host published (sha512 → sha256 → sha1, the strongest the metadata has); a mismatch is **refused outright**, catching broken downloads and swapped files |
+| Version cross-check | On top of "release only + publish date", the version number is used once more to block a candidate that would move the mod backwards |
+
+**A verification failure stops the run.** It does not quietly keep the old file and carry on:
+the mod is rolled back, everything that already succeeded is written, and the command exits
+non-zero — so a bad pick is visible immediately instead of being discovered weeks later.
+
+#### The lock file `packwiz-mod-lock.toml`
+
+Every successful update records the source, version, version ID, release type, file name, hash,
+why it was picked and when:
+
+```toml
+[mods."jei"]
+source = "modrinth"
+version-id = "9jqubC9n"
+version = "15.56.0.205"
+release-type = "release"
+filename = "jei-1.20.1-forge-15.56.0.205.jar"
+hash-format = "sha512"
+hash = "1306fe15c81d54aa9ff8f3d9f04812c0d61ffaaae433c29621f926db8f8e2c898669ccdd99e025849859d38b7a2eac170c466390b467f4dfa77542b5dbdd1678"
+selected-by = "newest full release"
+updated = "2026-10-29T06:47:54Z"
+```
+
+**Before planning, the files on disk are compared against it.** A file whose hash no longer
+matches is reported as `changed since ...` and that mod is skipped, so a jar swapped behind the
+tool's back cannot be carried along silently. `--force` overrides it.
+
+#### Disabled files are left alone
+
+A metadata file whose `filename` ends in `.jar.dis` or `.disabled` is skipped and counted
+(`Skipped because the file is disabled`); it is never renamed into an enabled `.jar` by an update.
+
+#### Backups and rollback
+
+Before replacing anything, `pack.toml`, `index.toml` and the jars about to be replaced are
+copied into `.packwiz-backup/<timestamp>/`. Any failure puts the old file and the old metadata back.
 
 | Measure | What it does |
 | --- | --- |
 | Download first | The new file goes to a temporary file and must pass its **hash check** before anything is replaced |
-| Automatic backup | The replaced file is moved to `.packwiz-backup/<timestamp>/`, never deleted |
+| Automatic backup | `pack.toml`, `index.toml` and the replaced jars are kept under `.packwiz-backup/<timestamp>/` |
 | Rollback | If any step fails, the old file **and** the old metadata are restored and the command exits non-zero |
+| Stop on mismatch | No downgrade, no silent fallback, no reuse of the old file |
 | Lock aware | Every destination must pass the `[sync]` lock |
 | Confirmation | Without `--yes` you see the plan and are asked first; `--dry-run` writes nothing |
 | Explicit targets | You must name mods or pass `--all`; nothing is updated silently |
+
+#### Flags
+
+| Flag | Description |
+| --- | --- |
+| `-a, --all` | Update every mod with a supported source |
+| `-n, --dry-run` | Show the plan only |
+| `-y, --yes` | Skip confirmation |
+| `--metadata-only` | Rewrite metadata, don't touch files |
+| `--prefer-version-number` | Rank by version number (off by default) |
+| `--include-disabled` | Also update `.dis` / `.disabled` mods |
+| `--force` | Update even when the lock check reports drift |
+| `--no-lock` / `--no-lock-check` | Don't write / don't compare `packwiz-mod-lock.toml` |
+| `--backup-dir DIR` | Backup folder (default `.packwiz-backup`) |
+| `--no-backup` | Delete replaced files instead of backing them up |
+| `--timeout N` | Seconds per download (default 60) |
 
 What it deliberately does **not** do: change the Minecraft version or loader, add dependencies
 automatically (same as upstream — add them with `packwiz modrinth add`), or delete files that
 are not part of the update. Pinned mods are skipped.
 
-> For servers: stop the server or take a snapshot before the first run. `.packwiz-backup/` is
-> in the default ignore list, so backups are never written into the index.
+> For servers: stop the server or take a snapshot before the first run. `.packwiz-backup/` and
+> `.packwiz-*.tmp` are in the default ignore list, so neither backups nor interrupt leftovers
+> are ever written into the index.
 
 ### `packwiz modrinth scan` — Modrinth only
 

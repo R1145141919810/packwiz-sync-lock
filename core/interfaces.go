@@ -27,6 +27,13 @@ type UpdateCheck struct {
 	UpdateString string
 	// CachedState can be used to preserve per-mod state between CheckUpdate and DoUpdate (e.g. file metadata)
 	CachedState interface{}
+	// NewVersion is the human readable version that would be installed (e.g. "1.2.3" or a
+	// file name), and NewVersionType is the host's own classification of it (release/beta/alpha).
+	NewVersion     string
+	NewVersionType string
+	// SkippedReason explains why an update the host offered was deliberately not taken,
+	// for example because it would downgrade the mod or is not a full release.
+	SkippedReason string
 	// Error stores an error for this specific mod
 	// Errors can also be returned from CheckUpdate directly, if the whole operation failed completely (so only 1 error is printed)
 	// If an error is returned for a mod, or from CheckUpdate, DoUpdate is not called on that mod / at all

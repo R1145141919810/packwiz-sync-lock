@@ -154,7 +154,7 @@ func runModScan(args []string) {
 		}
 	}
 
-	printCombinedResult(targets, modrinthResult, curseForgeResult, modScanDryRun, modScanStrict)
+	printCombinedResult(targets, modrinthResult, curseForgeResult, lock, modScanDryRun, modScanStrict)
 }
 
 // dedupeSorted returns the entries without duplicates, sorted.
@@ -173,7 +173,7 @@ func dedupeSorted(entries []string) []string {
 }
 
 // printCombinedResult prints one summary for both passes.
-func printCombinedResult(targets []core.ScanTarget, modrinthResult modrinth.ScanResult, curseForgeResult curseforge.ScanResult, dryRun bool, strict bool) {
+func printCombinedResult(targets []core.ScanTarget, modrinthResult modrinth.ScanResult, curseForgeResult curseforge.ScanResult, lock core.SyncLock, dryRun bool, strict bool) {
 	// Both passes may report the same file (Modrinth failed, then CurseForge did not know it),
 	// so merge and de-duplicate before printing.
 	failed := dedupeSorted(append(append([]string{}, modrinthResult.Failed...), curseForgeResult.Failed...))
@@ -194,6 +194,10 @@ func printCombinedResult(targets []core.ScanTarget, modrinthResult modrinth.Scan
 	}
 	if modrinthResult.Pruned+curseForgeResult.Pruned > 0 {
 		fmt.Printf("Local files pruned: %d\n", modrinthResult.Pruned+curseForgeResult.Pruned)
+		if lock.Download.FallbackEnabled() {
+			fmt.Println("Note: pruned files are no longer on this server, so the fallback-to-server download")
+			fmt.Println("      has nothing to serve for them; keep a copy if you rely on it.")
+		}
 	}
 	if len(curseForgeResult.ManualOnly) > 0 {
 		fmt.Printf("Need a manual download: %d\n", len(curseForgeResult.ManualOnly))

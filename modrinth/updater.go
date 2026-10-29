@@ -8,6 +8,7 @@ import (
 
 	"github.com/mitchellh/mapstructure"
 	"github.com/packwiz/packwiz/core"
+	"github.com/unascribed/FlexVer/go/flexver"
 )
 
 type mrUpdateData struct {
@@ -59,6 +60,25 @@ func (u mrUpdater) CheckUpdate(mods []*core.Mod, pack core.Pack) ([]core.UpdateC
 			continue
 		}
 
+		// A version published later can still be numerically older (a backport for an older
+		// branch, or a re-upload of an old line). Never turn that into a downgrade.
+		installedNumber := ""
+		if data.InstalledVersion != "" {
+			if installed, installedErr := mrDefaultClient.Versions.Get(data.InstalledVersion); installedErr == nil && installed.VersionNumber != nil {
+				installedNumber = *installed.VersionNumber
+			}
+		}
+		newNumber := ""
+		if newVersion.VersionNumber != nil {
+			newNumber = *newVersion.VersionNumber
+		}
+		if installedNumber != "" && newNumber != "" && flexver.Compare(newNumber, installedNumber) < 0 {
+			results[i] = core.UpdateCheck{
+				SkippedReason: fmt.Sprintf("would downgrade %s -> %s", installedNumber, newNumber),
+			}
+			continue
+		}
+
 		if len(newVersion.Files) == 0 {
 			results[i] = core.UpdateCheck{Error: errors.New("new version doesn't have any files")}
 			continue
@@ -72,9 +92,15 @@ func (u mrUpdater) CheckUpdate(mods []*core.Mod, pack core.Pack) ([]core.UpdateC
 			}
 		}
 
+		versionType := ""
+		if newVersion.VersionType != nil {
+			versionType = *newVersion.VersionType
+		}
 		results[i] = core.UpdateCheck{
 			UpdateAvailable: true,
 			UpdateString:    mod.FileName + " -> " + *newFilename,
+			NewVersion:      newNumber,
+			NewVersionType:  versionType,
 			CachedState:     cachedStateStore{data.ProjectID, newVersion},
 		}
 	}
